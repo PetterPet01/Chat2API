@@ -519,7 +519,8 @@ class GraphAPIMailAdapter(TempMailBackend):
         client_id: str = MS_DEFAULT_CLIENT_ID,
     ) -> None:
         import time
-        self.address = email.replace("@", f"+ds{int(time.time())}@")
+        # Use nanoseconds so parallel workers spawned in the same second get unique tags
+        self.address = email.replace("@", f"+ds{time.time_ns() // 1_000_000}@")
         self.password = password
         self._refresh_tok = refresh_token
         self._client_id = client_id
@@ -581,7 +582,11 @@ class GraphAPIMailAdapter(TempMailBackend):
         """Fetch the latest *top* messages from the Graph API inbox."""
         data = self._graph_get(
             "/me/messages",
-            params={"$top": top, "$select": "id,subject,body,bodyPreview"},
+            params={
+                "$top": top,
+                # Include toRecipients so we can route OTPs to the correct plus-address
+                "$select": "id,subject,body,bodyPreview,toRecipients",
+            },
         )
         return data.get("value", [])
 
@@ -598,12 +603,40 @@ class GraphAPIMailAdapter(TempMailBackend):
             content = _re.sub(r"<[^>]+>", " ", html_mod.unescape(content))
         return f"{subject}\n{content}"
 
-    def poll_for_otp(self, timeout: int = POLL_TIMEOUT, interval: int = POLL_INTERVAL) -> str:
-        log.info(f"  Polling Graph API inbox for OTP (up to {timeout}s)...")
+    @staticmethod
+    def _to_addresses(msg: dict) -> list[str]:
+        """Return lowercase list of 'To:' recipient addresses from a message."""
+        recipients = []
+        for r in msg.get("toRecipients", []):
+            addr = r.get("emailAddress", {}).get("address", "")
+            if addr:
+                recipients.append(addr.lower())
+        return recipients
+
+    def poll_for_otp(
+        self,
+        timeout: int = POLL_TIMEOUT,
+        interval: int = POLL_INTERVAL,
+        to_filter: str | None = None,
+    ) -> str:
+        """
+        Block until a 6-digit OTP arrives.
+
+        Args:
+            to_filter: If set (e.g. "user+ds123@hotmail.com"), only accept OTP
+                       emails addressed to this exact plus-address.  This
+                       enables safe parallel account creation: each worker
+                       listens only for its own OTP.
+        """
+        filter_lower = to_filter.lower() if to_filter else None
+        log.info(
+            f"  Polling Graph API inbox for OTP (up to {timeout}s)"
+            + (f" [to={filter_lower}]" if filter_lower else "") + "..."
+        )
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                messages = self._fetch_messages(top=10)
+                messages = self._fetch_messages(top=20)
             except Exception as e:
                 log.warning(f"  Graph API fetch error: {e} — retrying...")
                 time.sleep(interval)
@@ -612,6 +645,12 @@ class GraphAPIMailAdapter(TempMailBackend):
                 mid = msg.get("id", "")
                 if mid in self._seen_ids:
                     continue
+                # Plus-address routing: skip messages not addressed to our tag
+                if filter_lower:
+                    to_addrs = self._to_addresses(msg)
+                    if to_addrs and filter_lower not in to_addrs:
+                        log.debug(f"  ⏭  Skipping email for {to_addrs} (want {filter_lower})")
+                        continue  # Not our OTP — leave unseen so sibling worker can pick it up
                 self._seen_ids.add(mid)
                 subj = msg.get("subject", "")
                 log.info(f"  📧 New email: subject='{subj}'")
@@ -972,26 +1011,6 @@ def _extract_verification_link(text: str) -> str | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _find_deepseek_token_in_str(s: str) -> str | None:
-    """
-    DeepSeek auth tokens are base64-like strings stored in localStorage['userToken'].
-    Example: U4vsCtoBdxn1pfU4QclHNg2M9rVtBq82giPe2ilrFBfeiuR4yLj+mW31jjPIUl7z
-
-    Also handles JWT-style tokens (eyJ...) as a fallback.
-    """
-    if not s:
-        return None
-    # JWT first (more specific pattern)
-    m = re.search(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*", s)
-    if m:
-        return m.group(0)
-    # Base64 token (40+ chars)
-    m = re.search(r"[A-Za-z0-9+/]{40,}={0,2}", s)
-    if m and len(m.group(0)) >= 40:
-        return m.group(0)
-    return None
-
-
 def _scan_storage_for_token(driver) -> str | None:
     """Scan localStorage + sessionStorage + cookies for a DeepSeek auth token."""
     try:
@@ -1036,28 +1055,19 @@ def _scan_storage_for_token(driver) -> str | None:
                 if val.startswith("{"):
                     try:
                         parsed = json.loads(val)
-                        if "value" in parsed and isinstance(parsed["value"], str) and len(parsed["value"]) > 20:
-                            t = parsed["value"]
-                            log.info(f"  🔑 Token found in localStorage['userToken'] (JSON value): {t[:12]}...")
-                            return t
+                        if "value" in parsed:
+                            if isinstance(parsed["value"], str) and len(parsed["value"]) > 20:
+                                t = parsed["value"]
+                                log.info(f"  🔑 Token found in localStorage['userToken'] (JSON value): {t[:12]}...")
+                                return t
+                            else:
+                                continue # Invalid/null value, keep polling
                     except Exception as e:
                         log.warning(f"  Failed to parse userToken JSON: {e}")
-                
-                log.info(f"  🔑 Token found in localStorage['userToken']: {val[:12]}...")
-                return val
-            if val.startswith("{") or val.startswith("["):
-                try:
-                    parsed = json.loads(val)
-                    t = _search_dict_for_token(parsed)
-                    if t:
-                        log.info(f"  🔑 Token found in storage['{key}'] (JSON): {t[:12]}...")
-                        return t
-                except Exception:
-                    pass
-            t = _find_deepseek_token_in_str(val)
-            if t and len(t) >= 40:
-                log.info(f"  🔑 Token found in storage['{key}']: {t[:12]}...")
-                return t
+                else:
+                    log.info(f"  🔑 Token found in localStorage['userToken']: {val[:12]}...")
+                    return val
+
 
         found_keys = [item.get("k") for item in (items or [])]
         if found_keys:
@@ -1155,7 +1165,114 @@ def submit_token_to_api(
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+
+class DeepSeekAPI:
+    """Pure API-based DeepSeek account creation (Bypasses Selenium)."""
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+        import requests
+        self.client = requests.Session()
+        self.client.headers.update({
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+            "content-type": "application/json",
+            "origin": "https://platform.deepseek.com",
+            "referer": "https://platform.deepseek.com/sign_up",
+        })
+
+    def _generate_device_id(self) -> str:
+        import secrets
+        import base64
+        return base64.b64encode(secrets.token_bytes(64)).decode('utf-8')
+
+    def signup(self, email: str, password: str, otp_callback, seed_callback=None) -> str | None:
+        """
+        Register a new DeepSeek account via platform API.
+        Returns None — caller must use signin() afterwards to get the chat token
+        (the platform register token != chat token; WAF on chat.deepseek.com
+        requires a browser for the first login).
+        """
+        import sys, os, json, base64, asyncio, time
+        try:
+            from deepseek_python_api.pow import DeepSeekHashSolver, Challenge
+        except ImportError:
+            sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+            from deepseek_python_api.pow import DeepSeekHashSolver, Challenge
+
+        if seed_callback: seed_callback()
+        device_id = self._generate_device_id()
+        import logging
+        log = logging.getLogger("deepseek_signup")
+        log.info(f"Starting API signup → {email}")
+
+        # Step 1: Request OTP
+        res = self.client.post(
+            "https://platform.deepseek.com/auth-api/v0/users/create_email_verification_code",
+            json={"email": email, "turnstile_token": "", "locale": "en_US",
+                  "device_id": device_id, "scenario": "register"},
+        )
+        if res.status_code != 200 or res.json().get("code") != 0:
+            log.error(f"Failed to send OTP via API: {res.text}")
+            return None
+
+        log.info("OTP sent via API. Waiting for email...")
+        try:
+            otp = otp_callback()
+        except TimeoutError:
+            return None
+
+        # Step 2: Solve PoW challenge
+        res = self.client.post(
+            "https://platform.deepseek.com/auth-api/v0/users/create_guest_challenge",
+            json={"target_path": "/auth-api/v0/users/register"},
+        )
+        challenge = Challenge.from_payload(res.json()["data"]["biz_data"]["guest_challenge"])
+        solver = DeepSeekHashSolver()
+        b64_full = asyncio.run(solver.create_answer(challenge, "/auth-api/v0/users/register"))
+        full_pow = json.loads(base64.b64decode(b64_full).decode())
+        pow_header = base64.b64encode(
+            json.dumps({"salt": full_pow["salt"], "answer": full_pow["answer"]},
+                       separators=(',', ':')).encode()
+        ).decode()
+        solver.close()
+
+        # Step 3: Register
+        self.client.headers["x-ds-guest-pow-response"] = pow_header
+        res = self.client.post(
+            "https://platform.deepseek.com/auth-api/v0/users/register",
+            json={
+                "locale": "en_US", "region": "VN",
+                "payload": {"email": email, "email_verification_code": otp,
+                            "password": password},
+                "device_id": device_id, "os": "web",
+            },
+        )
+        if res.status_code != 200 or res.json().get("code") != 0:
+            log.error(f"Registration failed: {res.text}")
+            return None
+        log.info("✓ Account registered via API!")
+        # Return None — signin() is needed to get the chat.deepseek.com token.
+        return None
+
+    def signin(self, email: str, password: str, otp_callback=None, seed_callback=None) -> str | None:
+        """
+        Sign in to chat.deepseek.com using a headless Selenium browser.
+        Pure HTTP login is blocked by AWS WAF (202 JS challenge), so we use a
+        lightweight SeleniumBase session just for the sign-in step.
+        Returns the chat token string or None.
+        """
+        import logging
+        log = logging.getLogger("deepseek_signup")
+        log.info(f"Signing in (browser-assisted, headless): {email}")
+        sb_browser = DeepSeekBrowserSB(headless=True, debug=self.debug, manual_captcha=False)
+        return sb_browser.signin(
+            email=email,
+            password=password,
+            otp_callback=otp_callback,
+            seed_callback=seed_callback,
+        )
+
 class DeepSeekBrowserSB:
+
     """
     SeleniumBase UC (undetected-chromedriver) signup automation for platform.deepseek.com.
 
@@ -1681,47 +1798,12 @@ class DeepSeekBrowserSB:
                     "--disable-blink-features=AutomationControlled"
                 ),
             ) as sb:
-                # ── 1. Go directly to chat.deepseek.com ───────────────────────
-                log.info(f"  Loading {DEEPSEEK_CHAT_URL}...")
-                sb.uc_open_with_reconnect(DEEPSEEK_CHAT_URL, reconnect_time=4)
+                # ── 1. Go directly to platform.deepseek.com/sign_in ───────────────
+                log.info("  Loading https://platform.deepseek.com/sign_in...")
+                sb.uc_open_with_reconnect("https://platform.deepseek.com/sign_in", reconnect_time=4)
                 sb.sleep(3)
-                self._handle_captcha(sb)
-                sb.sleep(1)
-
-                # ── 2. Check if already logged in (token in storage) ──────────
-                token = _scan_storage_for_token(sb.driver)
-                if token:
-                    log.info("  ✅ Already logged in — token found directly!")
-                    return token
-
-                # ── 3. Find and click the login link / button ─────────────────
-                log.info("  Looking for login/signin button on chat.deepseek.com...")
-                # Try to click a visible Sign In button or link
-                sb.execute_script("""
-                    (function() {
-                        const keywords = ['sign in', 'login', 'log in', '登录', 'signin'];
-                        const candidates = document.querySelectorAll(
-                            'a, button, [role="button"], div.ds-button'
-                        );
-                        for (const el of candidates) {
-                            const txt = (el.textContent || '').trim().toLowerCase();
-                            if (keywords.some(kw => txt === kw || txt.includes(kw))) {
-                                el.click();
-                                return el.textContent.trim();
-                            }
-                        }
-                        return null;
-                    })()
-                """)
-                sb.sleep(2)
-
-                # ── 4. Navigate to sign_in if not already there ───────────────
-                current_url = sb.get_current_url()
-                if "sign_in" not in current_url and "login" not in current_url:
-                    log.info("  Navigating directly to sign_in page...")
-                    sb.uc_open_with_reconnect("https://chat.deepseek.com/sign_in", reconnect_time=4)
-                    sb.sleep(3)
-
+                sb.execute_script("try { localStorage.removeItem('userToken'); } catch(e) {}")
+                
                 self._handle_captcha(sb)
                 sb.sleep(1)
                 self._shot(sb, "signin_01_page")
@@ -1759,15 +1841,34 @@ class DeepSeekBrowserSB:
                 sb.sleep(0.8)
 
                 # ── 7. Fill password ──────────────────────────────────────────────────────
+                pass_sel = "input[type='password'], input[placeholder*='Password' i]"
                 try:
-                    sb.type("input[type='password'], input[placeholder*='Password' i]", password, timeout=3)
+                    sb.type(pass_sel, password, timeout=3)
                     log.info("  ✓ Password filled via sb.type")
                 except Exception as _e:
                     log.info(f"  Password field not found: {_e} — assuming OTP-only flow")
+                
+                try:
+                    self._js_set_value(sb, pass_sel, password)
+                    log.info("  ✓ Password filled via JS fallback")
+                except Exception:
+                    pass
 
                 sb.sleep(0.5)
                 self._shot(sb, "signin_02_filled")
 
+                try:
+                    sb.press_keys(pass_sel, "\\n")
+                    log.info("  ✓ Pressed ENTER on password field")
+                except Exception as _e:
+                    log.info(f"  Could not press ENTER: {_e}")
+
+                sb.sleep(1)
+
+                try:
+                    with open("page_source.html", "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                except: pass
                 # ── 8. Seed inbox before triggering OTP ───────────────────────
                 if seed_callback:
                     try:
@@ -1796,37 +1897,33 @@ class DeepSeekBrowserSB:
 
                 self._shot(sb, "signin_02b_pre_click")
 
+                # Click the Log in button using React internal props or SeleniumBase
                 clicked = None
-
-                # Strategy 1: Press Return on password field
-                try:
-                    from selenium.webdriver.common.keys import Keys as _Keys
-                    sb.press_keys("input[type='password'], input[placeholder*='Password' i]", _Keys.RETURN)
-                    log.info("  ✓ Return key on password field")
-                    clicked = "return-password"
-                except Exception:
-                    pass
-                
-                # Strategy 2: Press Return on email field
-                if not clicked:
+                for text in ["Log in", "Continue", "Sign in", "登录", "Đăng nhập"]:
                     try:
-                        from selenium.webdriver.common.keys import Keys as _Keys
-                        sb.press_keys(email_sel, _Keys.RETURN)
-                        log.info("  ✓ Return key on email field")
-                        clicked = "return-email"
+                        # React internal hack
+                        sb.execute_script(f"""
+                            const btns = document.querySelectorAll("div.ds-button, button");
+                            for (let btn of btns) {{
+                                if ((btn.textContent || '').trim().toLowerCase().includes("{text}".toLowerCase())) {{
+                                    const key = Object.keys(btn).find(k => k.startsWith("__reactProps$"));
+                                    if (key && btn[key] && btn[key].onClick) {{
+                                        btn[key].onClick({{ preventDefault: () => {{}}, stopPropagation: () => {{}} }});
+                                        return true;
+                                    }}
+                                    btn.click();
+                                    return true;
+                                }}
+                            }}
+                            return false;
+                        """)
+                        # Fallback to real CDP click
+                        sb.click(f'div.ds-button:contains("{text}"), button:contains("{text}")', timeout=2)
+                        log.info(f"  ✓ Clicked button with text: {text}")
+                        clicked = text
+                        break
                     except Exception:
-                        pass
-
-                # Strategy 3: Find a button containing "Log in", "Continue", or "Sign in"
-                if not clicked:
-                    for text in ["Log in", "Continue", "Sign in"]:
-                        try:
-                            sb.click(f'div[role="button"]:contains("{text}"), button:contains("{text}")', timeout=2)
-                            log.info(f"  ✓ Clicked button with text: {text}")
-                            clicked = text
-                            break
-                        except Exception:
-                            continue
+                        continue
 
                 log.info(f"  Final click result: {clicked}")
 
@@ -1924,22 +2021,39 @@ class DeepSeekBrowserSB:
 
                 # ── 11. Wait for redirect and scan for token ──────────────────
                 log.info("  Waiting for token in chat.deepseek.com storage...")
+                redirected_to_chat = False
                 for attempt in range(20):
+                    if attempt == 5:
+                        sb.save_screenshot("debug_login.png")
+                        log.info("  Saved screenshot to debug_login.png")
+                        try:
+                            with open("debug_login.html", "w", encoding="utf-8") as f:
+                                f.write(sb.get_page_source())
+                        except: pass
+                    
                     token = _scan_storage_for_token(sb.driver)
                     if token:
                         log.info("  ✅ Token found!")
                         break
+                    
                     current_url = sb.get_current_url()
                     log.debug(f"  [{attempt+1}/20] URL: {current_url[:80]}")
-                    # If we got redirected away from chat, go back
-                    if "chat.deepseek.com" not in current_url and "sign" not in current_url:
+                    
+                    # If we are on platform.deepseek.com and no longer on the signin page
+                    if not redirected_to_chat and "platform.deepseek.com" in current_url and "/sign" not in current_url:
+                        log.info(f"  ✓ Signin succeeded! Navigating to chat.deepseek.com to get token...")
+                        sb.uc_open_with_reconnect(DEEPSEEK_CHAT_URL, reconnect_time=4)
+                        redirected_to_chat = True
+                        sb.sleep(3)
+                        continue
+
+                    # If we somehow landed somewhere else
+                    if "chat.deepseek.com" not in current_url and "platform.deepseek.com" not in current_url:
                         log.info("  Navigating back to chat.deepseek.com...")
                         sb.uc_open_with_reconnect(DEEPSEEK_CHAT_URL, reconnect_time=4)
                         sb.sleep(3)
-                        token = _scan_storage_for_token(sb.driver)
-                        if token:
-                            log.info("  ✅ Token found after redirect!")
-                            break
+                        continue
+
                     sb.sleep(2)
 
                 self._shot(sb, "signin_05_final")
@@ -1962,6 +2076,7 @@ def create_one_account(
     manual_captcha: bool = False,
     api_url: str | None = None,
     api_key: str | None = None,
+    use_api_mode: bool = False,
 ) -> dict | None:
     """
     Full account creation flow:
@@ -1990,12 +2105,24 @@ def create_one_account(
     )
     log.info(f"  DeepSeek password will be: {ds_pw}")
 
-    browser = DeepSeekBrowserSB(headless=headless, debug=debug, manual_captcha=manual_captcha)
+    if use_api_mode:
+        browser = DeepSeekAPI(debug=debug)
+    else:
+        browser = DeepSeekBrowserSB(headless=headless, debug=debug, manual_captcha=manual_captcha)
+
+    # For GraphAPIMailAdapter, pass plus-address filter so parallel workers
+    # don't accidentally steal each other's OTPs.
+    _plus_filter: str | None = None
+    if hasattr(mail, "poll_for_otp") and hasattr(mail, "_to_addresses"):
+        _plus_filter = email  # email is already the plus-addressed version
 
     def get_otp() -> str:
-        return mail.poll_for_otp(timeout=120, interval=4)
+        kwargs = {"timeout": 120, "interval": 4}
+        if _plus_filter is not None:
+            kwargs["to_filter"] = _plus_filter  # type: ignore[assignment]
+        return mail.poll_for_otp(**kwargs)  # type: ignore[call-arg]
 
-    # Step 2: Browser signup
+    # Step 2: Signup (API or browser)
     token = browser.signup(
         email=email,
         password=ds_pw,
@@ -2032,7 +2159,6 @@ def create_one_account(
     token = browser.signin(
         email=email,
         password=ds_pw,
-        otp_callback=get_otp,
         seed_callback=mail.seed_seen_ids,
     )
     if token:
@@ -2040,6 +2166,60 @@ def create_one_account(
 
     log.error("❌ Failed to obtain token.")
     return None
+
+
+def create_accounts_parallel(
+    count: int,
+    *,
+    mail_service: str = "graphapi",
+    headless: bool = False,
+    debug: bool = False,
+    manual_captcha: bool = False,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    use_api_mode: bool = False,
+    max_workers: int = 10,
+) -> list[dict]:
+    """
+    Create *count* accounts in parallel, up to *max_workers* at a time.
+
+    With plus-addressing (GraphAPI backend), each worker uses a unique
+    plus-tag so OTP emails are routed to the correct worker with no
+    cross-contamination.  The number of truly parallel workers is bounded
+    by *max_workers* (default 10) — one per real email account.
+    """
+    import concurrent.futures
+    import threading
+
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> dict | None:
+        log.info(f"\n{'=' * 60}")
+        log.info(f"  Parallel worker {i + 1}/{count}")
+        log.info(f"{'=' * 60}")
+        acc = create_one_account(
+            mail_service=mail_service,
+            headless=headless,
+            debug=debug,
+            manual_captcha=manual_captcha,
+            api_url=api_url,
+            api_key=api_key,
+            use_api_mode=use_api_mode,
+        )
+        if acc:
+            with lock:
+                results.append(acc)
+                log.info(f"  Worker {i + 1}: ✅ {acc['email']}")
+        else:
+            log.warning(f"  Worker {i + 1}: ❌ failed")
+        return acc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, max_workers)) as pool:
+        futures = [pool.submit(worker, i) for i in range(count)]
+        concurrent.futures.wait(futures)
+
+    return results
 
 
 def main() -> None:
@@ -2060,6 +2240,27 @@ Examples:
   python scripts/deepseek_signup.py --api-url http://localhost:8000 --api-key mykey
   python scripts/deepseek_signup.py --headless --debug
         """,
+    )
+    parser.add_argument(
+        "--api-mode",
+        action="store_true",
+        help=(
+            "Hybrid API mode: registration via platform API (fast, no browser + PoW), "
+            "sign-in via headless browser (handles AWS WAF on chat.deepseek.com). "
+            "Removes need for full Selenium signup flow."
+        ),
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Create accounts in parallel using N concurrent workers (default: 1 = sequential). "
+            "Requires --mail-service graphapi (plus-addressing). Each worker uses a unique "
+            "plus-tag (e.g. user+ds<epoch>N@hotmail.com) so OTPs are routed correctly. "
+            "Recommended max: 10 (one per real inbox)."
+        ),
     )
     parser.add_argument("--count", type=int, default=1, help="Number of accounts to create")
     parser.add_argument("--headless", action="store_true", help="Run browser headlessly")
@@ -2254,32 +2455,50 @@ Examples:
         except Exception:
             pass
 
-    for i in range(args.count):
-        log.info(f"\n{'=' * 60}")
-        log.info(f"  Account {i + 1}/{args.count}")
-        log.info(f"{'=' * 60}")
+    common_kwargs = dict(
+        mail_service=args.mail_service,
+        headless=args.headless,
+        debug=args.debug,
+        manual_captcha=args.manual_captcha,
+        api_url=api_url,
+        api_key=api_key,
+        use_api_mode=args.api_mode,
+    )
 
-        acc = create_one_account(
-            mail_service=args.mail_service,
-            headless=args.headless,
-            debug=args.debug,
-            manual_captcha=args.manual_captcha,
-            api_url=api_url,
-            api_key=api_key,
+    if args.parallel > 1:
+        log.info(f"\n🚀 Parallel mode: {args.count} account(s) in batches of {args.parallel} workers")
+        if args.mail_service != "graphapi":
+            log.warning(
+                "⚠  --parallel works best with --mail-service graphapi (plus-addressing). "
+                "With other backends OTP routing is sequential and may be unreliable."
+            )
+        new_results = create_accounts_parallel(
+            args.count,
+            **common_kwargs,
+            max_workers=args.parallel,
         )
+        results.extend(new_results)
+        out_path.write_text(json.dumps(results, indent=2))
+    else:
+        for i in range(args.count):
+            log.info(f"\n{'=' * 60}")
+            log.info(f"  Account {i + 1}/{args.count}")
+            log.info(f"{'=' * 60}")
 
-        if acc:
-            results.append(acc)
-            out_path.write_text(json.dumps(results, indent=2))
-            log.info(f"  Saved to {out_path}")
-            print(f"\n  ✅ Token: {acc['token'][:40]}...")
-        else:
-            log.warning(f"  Account {i + 1}/{args.count} failed.")
+            acc = create_one_account(**common_kwargs)
 
-        if i < args.count - 1:
-            delay = random.randint(8, 15)
-            log.info(f"  Waiting {delay}s before next account...")
-            time.sleep(delay)
+            if acc:
+                results.append(acc)
+                out_path.write_text(json.dumps(results, indent=2))
+                log.info(f"  Saved to {out_path}")
+                print(f"\n  ✅ Token: {acc['token'][:40]}...")
+            else:
+                log.warning(f"  Account {i + 1}/{args.count} failed.")
+
+            if i < args.count - 1:
+                delay = random.randint(8, 15)
+                log.info(f"  Waiting {delay}s before next account...")
+                time.sleep(delay)
 
     log.info(f"\nDone. {len(results)} account(s) saved to {out_path}")
     if results:
