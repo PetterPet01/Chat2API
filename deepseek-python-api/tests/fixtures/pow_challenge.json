@@ -1,0 +1,13 @@
+{
+  "challenge": {
+    "algorithm": "DeepSeekHashV1",
+    "challenge": "148d95bf1c918b0f6aaa7ccbcf5c2b750706633a93ec2110b4e01ff44e9dae63",
+    "salt": "c5f13647852deec5b32c",
+    "signature": "c8e3752bc4f6cd3b57edc768fcf01adc3cdcb992bf9ebe48a289e8d41a7b55ed",
+    "difficulty": 144000,
+    "expire_at": 1785554095365,
+    "expire_after": 300000,
+    "target_path": "/api/v0/file/upload_file"
+  },
+  "target_path": "/api/v0/file/upload_file"
+}

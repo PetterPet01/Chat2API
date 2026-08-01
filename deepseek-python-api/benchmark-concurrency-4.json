@@ -1,0 +1,40 @@
+{
+  "configuration": {
+    "base_url": "http://127.0.0.1:8000",
+    "model": "deepseek-v4-flash",
+    "requests": 20,
+    "concurrency": 4,
+    "warmup": 2,
+    "stream": false,
+    "web_search": false,
+    "reasoning_effort": null,
+    "image": false
+  },
+  "summary": {
+    "attempted": 20,
+    "succeeded": 20,
+    "failed": 0,
+    "success_rate": 1.0,
+    "elapsed_seconds": 6.1554966240000795,
+    "requests_per_second": 3.249128579166246,
+    "latency_ms": {
+      "min": 742.8280589956557,
+      "mean": 852.9652510493179,
+      "p50": 833.7380310040317,
+      "p90": 932.2289322037252,
+      "p95": 1041.5444657515764,
+      "p99": 1064.996663550046,
+      "max": 1070.8597129996633
+    },
+    "ttft_ms": {
+      "min": null,
+      "mean": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "errors": {}
+  }
+}

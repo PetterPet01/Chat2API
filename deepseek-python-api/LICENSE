@@ -1,0 +1,5 @@
+This standalone Python implementation is distributed under the GNU General Public License, version 3 or later.
+
+It is based on and includes a WebAssembly asset from Chat2API, whose repository is licensed under GPL-3.0.
+
+See the repository-level LICENSE file for the complete GNU GPL version 3 text.
