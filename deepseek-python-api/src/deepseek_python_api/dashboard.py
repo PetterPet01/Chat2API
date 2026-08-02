@@ -22,12 +22,21 @@ DASHBOARD_HTML = """<!doctype html>
     button.secondary { background: #475569; }
     button.danger { background: #dc2626; }
     button.good { background: #16a34a; }
+    button.warning { background: #d97706; }
     .muted { color: #94a3b8; font-size: 13px; }
     .status { display: inline-block; border-radius: 999px; padding: 3px 9px; font-size: 12px; background: #475569; }
     .healthy { background: #166534; }
     .unhealthy, .disabled { background: #991b1b; }
     .cooldown { background: #92400e; }
+    .tag { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 11px; margin-right: 4px; }
+    .tag-static { background: #1e3a5f; color: #93c5fd; }
+    .tag-rotating { background: #3b1a6e; color: #c4b5fd; }
+    .tag-ready { background: #14532d; color: #86efac; }
+    .tag-cooldown { background: #78350f; color: #fcd34d; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #020617; padding: 12px; border-radius: 12px; color: #cbd5e1; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    th { text-align: left; color: #94a3b8; padding: 4px 8px; font-weight: 500; border-bottom: 1px solid #334155; }
+    td { padding: 6px 8px; border-bottom: 1px solid #1e293b; vertical-align: top; }
   </style>
 </head>
 <body>
@@ -48,6 +57,9 @@ DASHBOARD_HTML = """<!doctype html>
   <h2>Status</h2>
   <div id="summary" class="grid"></div>
 
+  <h2>Proxy Pool</h2>
+  <div id="proxy-pool-section"></div>
+
   <h2>Rotation</h2>
   <form onsubmit="setRotation(event)">
     <label for="strategy">Strategy</label>
@@ -64,6 +76,8 @@ DASHBOARD_HTML = """<!doctype html>
     <input id="name" placeholder="Personal account">
     <label for="token">DeepSeek web token</label>
     <input id="token" type="password" required>
+    <label for="proxy">Proxy override (optional)</label>
+    <input id="proxy" type="password" placeholder="Leave blank to assign from proxies.txt">
     <label><input id="check" type="checkbox" style="width:auto"> Check immediately</label>
     <button>Add token</button>
   </form>
@@ -80,13 +94,15 @@ const strategyInput = document.getElementById('strategy');
 const nameInput = document.getElementById('name');
 const tokenInput = document.getElementById('token');
 const checkInput = document.getElementById('check');
+const proxyInput = document.getElementById('proxy');
 const logOutput = document.getElementById('log');
 const summaryOutput = document.getElementById('summary');
 const tokensOutput = document.getElementById('tokens');
+const proxyPoolSection = document.getElementById('proxy-pool-section');
 keyInput.value = localStorage.getItem('deepseekManagementKey') || '';
 function saveKey() { localStorage.setItem('deepseekManagementKey', keyInput.value); log('Saved key locally.'); }
 function headers() { return { 'Authorization': `Bearer ${keyInput.value}`, 'Content-Type': 'application/json' }; }
-function log(message) { logOutput.textContent = `${new Date().toLocaleTimeString()} ${message}\n` + logOutput.textContent; }
+function log(message) { logOutput.textContent = `${new Date().toLocaleTimeString()} ${message}\\n` + logOutput.textContent; }
 async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
   const text = await response.text();
@@ -96,27 +112,79 @@ async function api(path, options = {}) {
   return body;
 }
 function statusClass(status) { return ['healthy','unhealthy','cooldown','disabled'].includes(status) ? status : ''; }
+
+function renderProxyPool(pool) {
+  if (!pool) { proxyPoolSection.innerHTML = '<div class="muted">No proxy pool data.</div>'; return; }
+  const total = pool.total ?? pool.count ?? 0;
+  const staticCount = pool.static ?? 0;
+  const rotatingCount = pool.rotating ?? 0;
+  const file = pool.file || 'proxies.txt';
+  const entries = pool.rotating_entries || [];
+
+  let rotatingRows = '';
+  if (entries.length > 0) {
+    rotatingRows = `
+      <h3 style="margin:16px 0 8px;font-size:14px;color:#94a3b8;">Rotating proxies</h3>
+      <table>
+        <tr><th>Proxy</th><th>Min interval</th><th>Next rotation in</th><th>Status</th><th>Action</th></tr>
+        ${entries.map(e => `
+          <tr>
+            <td style="font-family:monospace">${escapeHtml(e.proxy)}</td>
+            <td>${e.min_interval_seconds}s</td>
+            <td>${e.ready_to_rotate ? '—' : e.seconds_until_next_rotation + 's'}</td>
+            <td>${e.ready_to_rotate
+              ? '<span class="tag tag-ready">ready</span>'
+              : '<span class="tag tag-cooldown">cooldown</span>'}</td>
+            <td><button class="warning" onclick="rotateAll()" style="padding:5px 10px;font-size:12px;">Rotate IP</button></td>
+          </tr>`).join('')}
+      </table>`;
+  }
+
+  proxyPoolSection.innerHTML = `
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+        <span style="font-size:22px;font-weight:700;">${total}</span>
+        <span class="muted">total proxies from <code>${escapeHtml(file)}</code></span>
+        <span class="tag tag-static">${staticCount} static</span>
+        <span class="tag tag-rotating">${rotatingCount} rotating</span>
+        <button class="warning" onclick="rotateAll()" style="margin-left:auto;">Rotate all ready IPs</button>
+      </div>
+      ${rotatingRows}
+    </div>`;
+}
+
 async function loadAll() {
   try {
     const status = await api('/v0/management/status');
     strategyInput.value = status.rotation_strategy;
+    const pool = status.proxy_pool || {};
+    const total = pool.total ?? pool.count ?? 0;
+    const staticCount = pool.static ?? 0;
+    const rotatingCount = pool.rotating ?? 0;
     summaryOutput.innerHTML = `
       <div class="card"><strong>${status.token_count}</strong><div class="muted">managed tokens</div></div>
       <div class="card"><strong>${status.rotation_strategy}</strong><div class="muted">rotation strategy</div></div>
       <div class="card"><strong>${status.supervisor_running}</strong><div class="muted">health supervisor running</div></div>
+      <div class="card">
+        <strong>${staticCount} static · ${rotatingCount} rotating</strong>
+        <div class="muted">${total} proxies loaded</div>
+      </div>
       <div class="card"><strong>${JSON.stringify(status.counts)}</strong><div class="muted">status counts</div></div>`;
+    renderProxyPool(pool);
     const tokens = await api('/v0/management/tokens');
     tokensOutput.innerHTML = tokens.data.map(token => `
       <div class="card">
         <h3>${escapeHtml(token.name)}</h3>
         <div><span class="status ${statusClass(token.status)}">${token.status}</span></div>
         <p class="muted">${escapeHtml(token.redacted_token)} · ${escapeHtml(token.fingerprint)}</p>
+        <p class="muted">proxy ${escapeHtml(token.proxy || 'Direct')}</p>
         <p class="muted">success ${token.success_count} · failure ${token.failure_count} · in flight ${token.in_flight}</p>
         ${token.last_error ? `<p class="muted">last error: ${escapeHtml(token.last_error)}</p>` : ''}
         <button onclick="checkToken('${token.id}')">Check</button>
         <button class="secondary" onclick="renameToken('${token.id}', '${escapeAttr(token.name)}')">Rename</button>
         <button class="secondary" onclick="replaceToken('${token.id}')">Replace token</button>
         <button class="secondary" onclick="toggleToken('${token.id}', ${!token.enabled})">${token.enabled ? 'Disable' : 'Enable'}</button>
+        <button class="warning" onclick="rotateTokenProxy('${token.id}')">Rotate IP</button>
         <button class="danger" onclick="deleteToken('${token.id}')">Delete</button>
       </div>`).join('') || '<div class="muted">No managed tokens yet.</div>';
     log('Refreshed dashboard.');
@@ -125,8 +193,10 @@ async function loadAll() {
 async function addToken(event) {
   event.preventDefault();
   try {
-    await api('/v0/management/tokens', { method: 'POST', body: JSON.stringify({ name: nameInput.value, token: tokenInput.value, check: checkInput.checked }) });
-    nameInput.value = ''; tokenInput.value = ''; checkInput.checked = false;
+    const payload = { name: nameInput.value, token: tokenInput.value, check: checkInput.checked };
+    if (proxyInput.value) payload.proxy = proxyInput.value;
+    await api('/v0/management/tokens', { method: 'POST', body: JSON.stringify(payload) });
+    nameInput.value = ''; tokenInput.value = ''; proxyInput.value = ''; checkInput.checked = false;
     await loadAll();
   } catch (error) { log(`Error: ${error.message}`); }
 }
@@ -134,6 +204,22 @@ async function setRotation(event) {
   event.preventDefault();
   try { await api('/v0/management/rotation', { method: 'PATCH', body: JSON.stringify({ strategy: strategyInput.value }) }); await loadAll(); }
   catch (error) { log(`Error: ${error.message}`); }
+}
+async function rotateAll() {
+  try {
+    const result = await api('/v0/management/proxies/rotate', { method: 'POST' });
+    const entries = Object.entries(result.results || {});
+    if (entries.length === 0) { log('Rotate: no rotating proxies were ready (still in cooldown).'); }
+    else { entries.forEach(([proxy, ok]) => log(`Rotate ${proxy}: ${ok ? 'success ✓' : 'failed ✗'}`)); }
+    await loadAll();
+  } catch (error) { log(`Error: ${error.message}`); }
+}
+async function rotateTokenProxy(id) {
+  try {
+    const result = await api(`/v0/management/tokens/${id}/rotate-proxy`, { method: 'POST' });
+    log(`Rotate token proxy: ${result.message} (${result.proxy})`);
+    await loadAll();
+  } catch (error) { log(`Error: ${error.message}`); }
 }
 async function checkToken(id) { try { await api(`/v0/management/tokens/${id}/check`, { method: 'POST' }); await loadAll(); } catch (error) { log(`Error: ${error.message}`); } }
 async function checkAll() { try { await api('/v0/management/tokens/check', { method: 'POST' }); await loadAll(); } catch (error) { log(`Error: ${error.message}`); } }

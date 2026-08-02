@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import stat
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -17,6 +18,7 @@ from deepseek_python_api.errors import (
     DeepSeekProxyError,
     UpstreamProtocolError,
 )
+from deepseek_python_api.proxies import assign_proxy, load_proxy_entries, normalize_proxy_url
 from deepseek_python_api.settings import Settings
 from deepseek_python_api.token_manager import TokenManager
 from deepseek_python_api.upstream import DeepSeekClient
@@ -26,10 +28,18 @@ class FakeDeepSeekClient:
     def __init__(self) -> None:
         self.failures: dict[str, Exception] = {}
         self.checked: list[str] = []
+        self.checked_proxies: list[str | None] = []
         self.forgotten: list[str] = []
 
-    async def acquire_token(self, user_token: str, *, force_refresh: bool = False) -> str:
+    async def acquire_token(
+        self,
+        user_token: str,
+        *,
+        force_refresh: bool = False,
+        proxy_url: str | None = None,
+    ) -> str:
         self.checked.append(user_token)
+        self.checked_proxies.append(proxy_url)
         failure = self.failures.get(user_token)
         if failure:
             raise failure
@@ -42,6 +52,7 @@ class FakeDeepSeekClient:
 def make_settings(path: Path, **overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "tokens_file": str(path),
+        "proxies_file": str(path.with_name("missing-proxies.txt")),
         "token_health_check_interval_seconds": 0,
         "token_failure_cooldown_seconds": 60,
     }
@@ -51,6 +62,33 @@ def make_settings(path: Path, **overrides: Any) -> Settings:
 
 def token_manager(settings: Settings, client: FakeDeepSeekClient) -> TokenManager:
     return TokenManager(settings, cast("DeepSeekClient", client))
+
+
+def test_proxy_parser_normalizes_redacts_and_deduplicates(tmp_path: Path) -> None:
+    proxy_file = tmp_path / "proxies.txt"
+    proxy_file.write_text(
+        "\n"
+        "# comment\n"
+        "user:pass@example.com:8080\n"
+        "http://plain.example.com:3128\n"
+        "https://secure.example.com:8443\n"
+        "socks5://ignored.example.com:1080\n"
+        "bad.example.com:notaport\n"
+        "user:pass@example.com:8080\n",
+        encoding="utf-8",
+    )
+
+    assert normalize_proxy_url("host.example.com:8080") == "http://host.example.com:8080"
+    assert normalize_proxy_url("bad.example.com:notaport") is None
+
+    entries = load_proxy_entries(proxy_file)
+    assert [entry.url for entry in entries] == [
+        "http://user:pass@example.com:8080",
+        "http://plain.example.com:3128",
+        "https://secure.example.com:8443",
+    ]
+    assert entries[0].redacted == "http://***@example.com:8080"
+    assert assign_proxy(entries, 4) == entries[1]
 
 
 @pytest.mark.asyncio
@@ -160,6 +198,91 @@ async def test_token_manager_error_paths_supervisor_and_short_redaction(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_token_manager_assigns_persists_and_uses_proxies(tmp_path: Path) -> None:
+    proxies = tmp_path / "proxies.txt"
+    proxies.write_text(
+        "user:pass@proxy-one.example:8001\nproxy-two.example:8002\n",
+        encoding="utf-8",
+    )
+    client = FakeDeepSeekClient()
+    manager = token_manager(
+        make_settings(tmp_path / "tokens.json", proxies_file=str(proxies)), client
+    )
+    manager.load()
+
+    first = await manager.add_token("first-token", name="first")
+    second = await manager.add_token("second-token", name="second")
+    third = await manager.add_token("third-token", name="third")
+
+    assert first["proxy"] == "http://***@proxy-one.example:8001"
+    assert second["proxy"] == "http://proxy-two.example:8002"
+    assert third["proxy"] == "http://***@proxy-one.example:8001"
+    assert "pass" not in str(first)
+
+    await manager.check_token(str(first["id"]))
+    assert client.checked_proxies[-1] == "http://user:pass@proxy-one.example:8001"
+
+    reloaded = token_manager(
+        make_settings(tmp_path / "tokens.json", proxies_file=str(proxies)), client
+    )
+    reloaded.load()
+    assert (await reloaded.list_tokens())[0]["proxy"] == "http://***@proxy-one.example:8001"
+    proxy_pool_summary = (await reloaded.summary())["proxy_pool"]
+    assert proxy_pool_summary["file"] == str(proxies)
+    assert proxy_pool_summary["total"] == 2
+    assert proxy_pool_summary["static"] == 2
+    assert proxy_pool_summary["rotating"] == 0
+
+    lease = await reloaded.acquire()
+    assert lease.proxy_url == "http://user:pass@proxy-one.example:8001"
+    await lease.release(success=True)
+
+
+@pytest.mark.asyncio
+async def test_upstream_routes_assigned_proxy(tmp_path: Path) -> None:
+    seen = asyncio.Event()
+
+    async def proxy_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        data = await reader.read(4096)
+        first_line = data.split(b"\r\n", 1)[0]
+        assert first_line == b"GET http://deepseek.example/api/v0/users/current HTTP/1.1"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 40\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b'{"data":{"biz_data":{"token":"access"}}}'
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        seen.set()
+
+    server = await asyncio.start_server(proxy_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    direct = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(599)))
+    client = DeepSeekClient(
+        settings=Settings(
+            deepseek_api_base="http://deepseek.example/api",
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
+        ),
+        http_client=direct,
+        pow_solver=cast("Any", object()),
+    )
+    try:
+        async with server:
+            token = await client.acquire_token("user-token", proxy_url=f"http://127.0.0.1:{port}")
+            assert token == "access"
+            await asyncio.wait_for(seen.wait(), timeout=1)
+    finally:
+        server.close()
+        await server.wait_closed()
+        await client.aclose()
+        await direct.aclose()
+
+
+@pytest.mark.asyncio
 async def test_token_health_states_and_cooldown(tmp_path: Path) -> None:
     client = FakeDeepSeekClient()
     client.failures["expired-token"] = AuthenticationError()
@@ -195,8 +318,10 @@ async def test_management_api_crud_dashboard_and_validation(
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
         Settings(
+            api_key=None,
             management_api_key=SecretStr("management-key"),
             tokens_file=str(tmp_path / "tokens.json"),
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
             token_health_check_interval_seconds=0,
         ),
         http_client=upstream,
@@ -318,8 +443,10 @@ async def test_managed_chat_failover_uses_next_token(
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
         Settings(
+            api_key=None,
             management_api_key=SecretStr("management-key"),
             tokens_file=str(tmp_path / "tokens.json"),
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
             token_health_check_interval_seconds=0,
             deepseek_api_base="https://chat.deepseek.test/api",
         ),

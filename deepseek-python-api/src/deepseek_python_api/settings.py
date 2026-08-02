@@ -21,9 +21,19 @@ class Settings(BaseSettings):
     management_api_key: SecretStr | None = Field(default=None)
 
     tokens_file: str = "deepseek_tokens.json"
+    proxies_file: str = "proxies.txt"
     rotation_strategy: Literal["fill_first", "round_robin"] = "fill_first"
     token_health_check_interval_seconds: int = Field(default=300, ge=0, le=86400)
     token_failure_cooldown_seconds: int = Field(default=300, ge=0, le=86400)
+
+    # Rotating proxy behaviour
+    # When True, a rate-limit (429) response automatically triggers IP rotation
+    # on any rotating proxy bound to that token before the next retry.
+    proxy_rotate_on_ratelimit: bool = True
+    # Minimum seconds that must pass between automatic rotation attempts on the
+    # *same* rotating proxy (provider hard limit is 60 s; we default to 61 s to
+    # give a small safety margin).
+    proxy_rotate_min_interval_seconds: float = Field(default=61.0, ge=0.0, le=3600.0)
 
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)

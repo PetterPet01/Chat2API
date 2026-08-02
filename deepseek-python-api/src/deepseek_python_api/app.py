@@ -23,6 +23,7 @@ from .errors import (
 )
 from .models import MODELS
 from .pow import DeepSeekHashSolver, PowSolverProtocol
+from .proxies import normalize_proxy_url
 from .schemas import ChatCompletionRequest, ModelList, ModelObject
 from .service import CompletionContext, CompletionService
 from .settings import Settings, get_settings
@@ -49,6 +50,7 @@ class AddManagedTokenRequest(BaseModel):
     name: str | None = None
     enabled: bool = True
     check: bool = False
+    proxy: str | None = None
 
 
 class UpdateManagedTokenRequest(BaseModel):
@@ -57,6 +59,7 @@ class UpdateManagedTokenRequest(BaseModel):
     token: str | None = None
     name: str | None = None
     enabled: bool | None = None
+    proxy: str | None = None
 
 
 class UpdateRotationRequest(BaseModel):
@@ -100,6 +103,7 @@ def create_app(
         )
         yield
         await token_manager.stop_supervisor()
+        await upstream.aclose()
         if owns_http_client:
             await client.aclose()
         if owns_pow_solver and isinstance(solver, DeepSeekHashSolver):
@@ -198,6 +202,19 @@ def create_app(
             return TokenLease(None, x_deepseek_token, None)
         return await runtime.token_manager.acquire()
 
+    def normalize_request_proxy(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_proxy_url(value)
+        if normalized is None:
+            raise DeepSeekProxyError(
+                "Invalid proxy URL",
+                status_code=400,
+                code="invalid_proxy",
+                error_type="invalid_request_error",
+            )
+        return normalized
+
     async def start_with_token_failover(
         body: ChatCompletionRequest,
         initial_lease: TokenLease,
@@ -211,6 +228,19 @@ def create_app(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # Auto-rotate the rotating proxy on 429 rate-limit before failing over
+                if (
+                    runtime.settings.proxy_rotate_on_ratelimit
+                    and _is_ratelimit_error(exc)
+                    and lease.proxy_url
+                ):
+                    LOGGER.info(
+                        "Rate-limit detected; attempting proxy IP rotation for %s",
+                        lease.proxy_url,
+                    )
+                    await runtime.token_manager.proxy_pool.rotate_for_proxy_url(
+                        lease.proxy_url, client=runtime.http_client
+                    )
                 if not _should_failover(lease, exc):
                     raise
                 if lease.token_id:
@@ -220,6 +250,14 @@ def create_app(
                 except DeepSeekProxyError:
                     raise exc from None
                 LOGGER.info("Retrying DeepSeek completion with another managed token")
+
+    def _is_ratelimit_error(exc: BaseException) -> bool:
+        """Return True when the upstream responded with HTTP 429."""
+        if isinstance(exc, UpstreamProtocolError):
+            return exc.status_code == 429
+        if isinstance(exc, DeepSeekProxyError):
+            return exc.status_code == 429
+        return False
 
     def _should_failover(lease: TokenLease, exc: BaseException) -> bool:
         if lease.manager is None or lease.token_id is None:
@@ -280,6 +318,7 @@ def create_app(
             payload.token,
             name=payload.name,
             enabled=payload.enabled,
+            proxy_url=normalize_request_proxy(payload.proxy),
         )
         if payload.check:
             view = await _runtime(app).token_manager.check_token(str(view["id"]))
@@ -301,6 +340,7 @@ def create_app(
             name=payload.name,
             token=payload.token,
             enabled=payload.enabled,
+            proxy_url=normalize_request_proxy(payload.proxy),
         )
 
     @app.delete(
@@ -326,6 +366,33 @@ def create_app(
         payload: Annotated[UpdateRotationRequest, Body()],
     ) -> dict[str, object]:
         return await _runtime(app).token_manager.set_strategy(payload.strategy)
+
+    # -----------------------------------------------------------------------
+    # Proxy-pool management
+    # -----------------------------------------------------------------------
+
+    @app.get("/v0/management/proxies", dependencies=[Depends(require_management_api_key)])
+    async def proxy_pool_status() -> dict[str, object]:
+        """Return status of the entire proxy pool (static + rotating entries)."""
+        return _runtime(app).token_manager.proxy_pool.summary()
+
+    @app.post("/v0/management/proxies/rotate", dependencies=[Depends(require_management_api_key)])
+    async def rotate_all_proxies() -> dict[str, object]:
+        """Trigger IP rotation for every rotating proxy whose cooldown has expired."""
+        runtime = _runtime(app)
+        results = await runtime.token_manager.proxy_pool.rotate_all(client=runtime.http_client)
+        return {"results": results}
+
+    @app.post(
+        "/v0/management/tokens/{token_id}/rotate-proxy",
+        dependencies=[Depends(require_management_api_key)],
+    )
+    async def rotate_token_proxy(token_id: str) -> dict[str, object]:
+        """Rotate the IP of the rotating proxy bound to a specific token."""
+        runtime = _runtime(app)
+        return await runtime.token_manager.rotate_proxy_for_token(
+            token_id, http_client=runtime.http_client
+        )
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:

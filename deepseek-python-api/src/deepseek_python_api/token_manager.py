@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+import httpx
+
 from .errors import AuthenticationError, ConfigurationError, DeepSeekProxyError
+from .proxies import ProxyEntry, ProxyPool, RotatingProxyEntry, assign_proxy, load_proxy_entries
 from .settings import Settings
 from .upstream import DeepSeekClient
 
@@ -41,6 +44,7 @@ class ManagedToken:
     last_used_at: float | None = None
     cooldown_until: float | None = None
     in_flight: int = 0
+    proxy_url: str | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -71,6 +75,9 @@ class ManagedToken:
             consecutive_failures=max(0, int(payload.get("consecutive_failures") or 0)),
             last_used_at=_optional_float(payload.get("last_used_at")),
             cooldown_until=_optional_float(payload.get("cooldown_until")),
+            proxy_url=payload.get("proxy_url")
+            if isinstance(payload.get("proxy_url"), str)
+            else None,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -90,6 +97,7 @@ class ManagedToken:
             "consecutive_failures": self.consecutive_failures,
             "last_used_at": self.last_used_at,
             "cooldown_until": self.cooldown_until,
+            "proxy_url": self.proxy_url,
         }
 
     def public_view(self, now: float | None = None) -> dict[str, Any]:
@@ -117,6 +125,7 @@ class ManagedToken:
             "last_used_at": self.last_used_at,
             "cooldown_until": self.cooldown_until,
             "in_flight": self.in_flight,
+            "proxy": redact_proxy(self.proxy_url),
         }
 
 
@@ -125,6 +134,7 @@ class TokenLease:
     token_id: str | None
     token: str
     manager: TokenManager | None
+    proxy_url: str | None = None
     _released: bool = False
 
     async def release(self, *, success: bool, error: BaseException | None = None) -> None:
@@ -142,11 +152,18 @@ class TokenManager:
         self.path = Path(settings.tokens_file).expanduser()
         self.strategy: RotationStrategy = settings.rotation_strategy
         self._tokens: list[ManagedToken] = []
+        self._proxy_pool: ProxyPool = ProxyPool([])
         self._round_robin_index = 0
         self._lock = asyncio.Lock()
         self._supervisor_task: asyncio.Task[None] | None = None
 
+    @property
+    def proxy_pool(self) -> ProxyPool:
+        return self._proxy_pool
+
     def load(self) -> None:
+        entries = load_proxy_entries(self.settings.proxies_file)
+        self._proxy_pool = ProxyPool(entries)
         if not self.path.exists():
             self._tokens = []
             return
@@ -163,7 +180,10 @@ class TokenManager:
         self._tokens = [
             ManagedToken.from_payload(item) for item in tokens if isinstance(item, dict)
         ]
+        assigned_missing = self._assign_missing_proxies_unlocked()
         self._round_robin_index = int(payload.get("round_robin_index") or 0)
+        if assigned_missing:
+            self._save_unlocked()
 
     async def start_supervisor(self) -> None:
         if self.settings.token_health_check_interval_seconds <= 0 or self._supervisor_task:
@@ -195,11 +215,12 @@ class TokenManager:
                 token.last_used_at = time.time()
                 token.updated_at = token.last_used_at
                 self._save_unlocked()
-                return TokenLease(token.id, token.token, self)
+                return TokenLease(token.id, token.token, self, token.proxy_url)
 
             configured = self.settings.configured_deepseek_token()
             if configured:
-                return TokenLease(None, configured, None)
+                proxy = self._proxy_pool.pick(0)
+                return TokenLease(None, configured, None, proxy.url if proxy else None)
             raise ConfigurationError("No DeepSeek tokens are configured")
 
     async def release(
@@ -217,7 +238,12 @@ class TokenManager:
             self._save_unlocked()
 
     async def add_token(
-        self, token: str, *, name: str | None = None, enabled: bool = True
+        self,
+        token: str,
+        *,
+        name: str | None = None,
+        enabled: bool = True,
+        proxy_url: str | None = None,
     ) -> dict[str, Any]:
         if not token:
             raise DeepSeekProxyError(
@@ -236,6 +262,10 @@ class TokenManager:
                     error_type="invalid_request_error",
                 )
             now = time.time()
+            proxy = self._proxy_pool.pick(len(self._tokens))
+            assigned_proxy_url = (
+                proxy_url if proxy_url is not None else proxy.url if proxy else None
+            )
             record = ManagedToken(
                 id=f"tok_{uuid4().hex}",
                 name=name or f"DeepSeek token {len(self._tokens) + 1}",
@@ -243,6 +273,7 @@ class TokenManager:
                 enabled=enabled,
                 created_at=now,
                 updated_at=now,
+                proxy_url=assigned_proxy_url,
             )
             self._tokens.append(record)
             self._save_unlocked()
@@ -255,6 +286,7 @@ class TokenManager:
         name: str | None = None,
         token: str | None = None,
         enabled: bool | None = None,
+        proxy_url: str | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
             record = self._require_token(token_id)
@@ -289,6 +321,13 @@ class TokenManager:
                 record.enabled = enabled
                 if enabled and record.status == "disabled":
                     record.status = "unchecked"
+            if proxy_url is not None and proxy_url != record.proxy_url:
+                self.client.forget_token(record.token)
+                record.proxy_url = proxy_url
+                record.status = "unchecked"
+                record.last_error = None
+                record.cooldown_until = None
+                record.consecutive_failures = 0
             record.updated_at = time.time()
             self._save_unlocked()
             return record.public_view()
@@ -335,14 +374,19 @@ class TokenManager:
             "token_count": len(views),
             "counts": counts,
             "has_static_fallback": self.settings.configured_deepseek_token() is not None,
+            "proxy_pool": {
+                "file": self.settings.proxies_file,
+                **self._proxy_pool.summary(),
+            },
         }
 
     async def check_token(self, token_id: str) -> dict[str, Any]:
         async with self._lock:
             record = self._require_token(token_id)
             raw_token = record.token
+            proxy_url = record.proxy_url
         try:
-            await self.client.acquire_token(raw_token, force_refresh=True)
+            await self.client.acquire_token(raw_token, force_refresh=True, proxy_url=proxy_url)
         except Exception as exc:
             async with self._lock:
                 record = self._require_token(token_id)
@@ -436,6 +480,49 @@ class TokenManager:
             token.status = "cooldown"
             token.cooldown_until = now + self.settings.token_failure_cooldown_seconds
 
+    def _assign_missing_proxies_unlocked(self) -> bool:
+        assigned = False
+        for index, token in enumerate(self._tokens):
+            if token.proxy_url is None:
+                proxy = self._proxy_pool.pick(index)
+                if proxy:
+                    token.proxy_url = proxy.url
+                    assigned = True
+        return assigned
+
+    async def rotate_proxy_for_token(
+        self,
+        token_id: str,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> dict[str, object]:
+        """Attempt to rotate the IP of the rotating proxy bound to *token_id*.
+
+        Returns a dict with ``{rotated: bool, proxy: str, message: str}``.
+        """
+        async with self._lock:
+            record = self._require_token(token_id)
+            proxy_url = record.proxy_url
+
+        if not proxy_url:
+            return {"rotated": False, "proxy": None, "message": "Token has no proxy assigned"}
+
+        entry = self._proxy_pool.find_by_url(proxy_url)
+        if not isinstance(entry, RotatingProxyEntry):
+            return {
+                "rotated": False,
+                "proxy": entry.redacted if entry else proxy_url,
+                "message": "Proxy is static — cannot rotate",
+            }
+
+        ok = await entry.rotate(client=http_client)
+        return {
+            "rotated": ok,
+            "proxy": entry.redacted,
+            "seconds_until_next": round(entry.seconds_until_next_rotation, 1),
+            "message": "Rotation succeeded" if ok else "Rotation skipped (too early or failed)",
+        }
+
     def _find_token(self, token_id: str) -> ManagedToken | None:
         return next((token for token in self._tokens if token.id == token_id), None)
 
@@ -474,6 +561,11 @@ def redact_token(token: str) -> str:
     if len(token) <= 8:
         return "****"
     return f"{token[:4]}...{token[-4:]}"
+
+
+def redact_proxy(proxy_url: str | None) -> str | None:
+    from .proxies import StaticProxyEntry as _SE
+    return _SE(proxy_url).redacted if proxy_url else None
 
 
 def _safe_error(error: BaseException | None) -> str | None:
