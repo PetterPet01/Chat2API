@@ -78,6 +78,7 @@ import logging
 import random
 import re
 import string
+import threading
 import time
 from abc import ABC, abstractmethod
 from email import policy
@@ -93,6 +94,43 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("deepseek_signup")
+
+# ── Sync Rotating Proxy ───────────────────────────────────────────────────────
+class SyncRotatingProxy:
+    """Thread-safe synchronous proxy rotator for deepseek_signup."""
+    def __init__(self, proxy_url: str, rotate_url: str, min_interval: float = 61.0):
+        self.proxy_url = proxy_url
+        self.rotate_url = rotate_url
+        self.min_interval = min_interval
+        self.last_rotated_at = 0.0
+        self.lock = threading.Lock()
+
+    def wait_and_rotate(self, logger=log) -> None:
+        """Wait for the cooldown if necessary, then rotate the IP."""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_rotated_at
+            
+            # If the IP was rotated very recently (e.g., by another parallel worker
+            # in the same batch), piggyback off that rotation instead of sleeping
+            # for 61 seconds. 5 seconds is a generous window for threads starting together.
+            if elapsed < 5.0:
+                return
+
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                logger.info(f"⏳ Waiting {wait_time:.1f}s for IP rotation cooldown on {self.proxy_url}...")
+                time.sleep(wait_time)
+            
+            try:
+                resp = requests.get(self.rotate_url, timeout=15.0)
+                resp.raise_for_status()
+                self.last_rotated_at = time.time()
+                logger.info(f"🔄 Rotated IP for {self.proxy_url} successfully (HTTP {resp.status_code}).")
+            except Exception as exc:
+                logger.warning(f"⚠ Failed to rotate IP for {self.proxy_url}: {exc}")
+
+ProxyConfig = str | SyncRotatingProxy
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAIL_TM_BASE = "https://api.mail.tm"
@@ -373,9 +411,7 @@ class ICloudHMEAdapter(TempMailBackend):
         self.password = ""
         self._anonymous_id = anon_id
         self._created_after = time.time()
-        log.info(
-            f"  ✓ Reserved HME alias: {hme}"
-        )
+        log.info(f"  ✓ Reserved HME alias: {hme}")
         return hme, ""
 
     def _imap_connect(self) -> imaplib.IMAP4_SSL:
@@ -434,8 +470,10 @@ class ICloudHMEAdapter(TempMailBackend):
                     mb.noop()
                     uids = self._imap_search_new(mb)
                 except Exception:
-                    try: mb.logout()
-                    except: pass
+                    try:
+                        mb.logout()
+                    except:
+                        pass
                     mb = self._imap_connect()
                     uids = self._imap_search_new(mb)
 
@@ -450,8 +488,10 @@ class ICloudHMEAdapter(TempMailBackend):
                         return otp
                 time.sleep(interval)
         finally:
-            try: mb.logout()
-            except: pass
+            try:
+                mb.logout()
+            except:
+                pass
         raise TimeoutError(f"No OTP found in iCloud inbox in {timeout}s.")
 
     def poll_for_verification_link(
@@ -470,8 +510,10 @@ class ICloudHMEAdapter(TempMailBackend):
                     mb.noop()
                     uids = self._imap_search_new(mb)
                 except Exception:
-                    try: mb.logout()
-                    except: pass
+                    try:
+                        mb.logout()
+                    except:
+                        pass
                     mb = self._imap_connect()
                     uids = self._imap_search_new(mb)
 
@@ -485,8 +527,10 @@ class ICloudHMEAdapter(TempMailBackend):
                         return link
                 time.sleep(interval)
         finally:
-            try: mb.logout()
-            except: pass
+            try:
+                mb.logout()
+            except:
+                pass
         return None
 
 
@@ -498,7 +542,9 @@ class ICloudHMEAdapter(TempMailBackend):
 def parse_graphapi_credential(cred_str: str) -> dict:
     parts = cred_str.strip().split("|")
     if len(parts) < 3:
-        raise ValueError("Graph API credential must have at least 3 segments: 'email|pass|refresh_token[|client_id]'.")
+        raise ValueError(
+            "Graph API credential must have at least 3 segments: 'email|pass|refresh_token[|client_id]'."
+        )
     email = parts[0].strip()
     if not email:
         raise ValueError("Email cannot be empty.")
@@ -507,7 +553,12 @@ def parse_graphapi_credential(cred_str: str) -> dict:
     if not refresh_token:
         raise ValueError("refresh_token cannot be empty.")
     client_id = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else MS_DEFAULT_CLIENT_ID
-    return {"email": email, "password": password, "refresh_token": refresh_token, "client_id": client_id}
+    return {
+        "email": email,
+        "password": password,
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
 
 
 class GraphAPIMailAdapter(TempMailBackend):
@@ -519,6 +570,7 @@ class GraphAPIMailAdapter(TempMailBackend):
         client_id: str = MS_DEFAULT_CLIENT_ID,
     ) -> None:
         import time
+
         # Use nanoseconds so parallel workers spawned in the same second get unique tags
         self.address = email.replace("@", f"+ds{time.time_ns() // 1_000_000}@")
         self.password = password
@@ -631,7 +683,8 @@ class GraphAPIMailAdapter(TempMailBackend):
         filter_lower = to_filter.lower() if to_filter else None
         log.info(
             f"  Polling Graph API inbox for OTP (up to {timeout}s)"
-            + (f" [to={filter_lower}]" if filter_lower else "") + "..."
+            + (f" [to={filter_lower}]" if filter_lower else "")
+            + "..."
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -984,7 +1037,8 @@ class TempMail(HydraMailAdapter):
 def _extract_otp(text: str) -> str | None:
     if not text:
         return None
-    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    # \b ensures the 6 digits stand alone (not part of an email address like user123456@...)
+    m = re.search(r"\b(\d{6})\b", text)
     return m.group(1) if m else None
 
 
@@ -1058,20 +1112,23 @@ def _scan_storage_for_token(driver) -> str | None:
                         if "value" in parsed:
                             if isinstance(parsed["value"], str) and len(parsed["value"]) > 20:
                                 t = parsed["value"]
-                                log.info(f"  🔑 Token found in localStorage['userToken'] (JSON value): {t[:12]}...")
+                                log.info(
+                                    f"  🔑 Token found in localStorage['userToken'] (JSON value): {t[:12]}..."
+                                )
                                 return t
                             else:
-                                continue # Invalid/null value, keep polling
+                                continue  # Invalid/null value, keep polling
                     except Exception as e:
                         log.warning(f"  Failed to parse userToken JSON: {e}")
                 else:
                     log.info(f"  🔑 Token found in localStorage['userToken']: {val[:12]}...")
                     return val
 
-
         found_keys = [item.get("k") for item in (items or [])]
         if found_keys:
-            log.info(f"  [Scan] No token found yet. Storage keys present: {', '.join(k for k in found_keys if k)}")
+            log.info(
+                f"  [Scan] No token found yet. Storage keys present: {', '.join(k for k in found_keys if k)}"
+            )
         else:
             log.info("  [Scan] Storage is completely empty!")
     except Exception as e:
@@ -1119,13 +1176,14 @@ def submit_token_to_api(
     name: str,
     api_url: str = DEFAULT_API_URL,
     api_key: str = DEFAULT_API_KEY,
+    proxy: str | None = None,
 ) -> bool:
     """
     POST the DeepSeek auth token to deepseek-python-api's management endpoint.
 
     POST /v0/management/tokens
     Authorization: Bearer <api_key>
-    {"token": "<token>", "name": "<name>", "enabled": true, "check": false}
+    {"token": "<token>", "name": "<name>", "enabled": true, "check": false, "proxy": "<proxy>"}
 
     Returns True on success, False on any error.
     """
@@ -1140,6 +1198,8 @@ def submit_token_to_api(
         "enabled": True,
         "check": False,
     }
+    if proxy:
+        payload["proxy"] = proxy
     log.info(f"  ↑ Submitting token to deepseek-python-api: {url}")
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=20)
@@ -1164,115 +1224,483 @@ def submit_token_to_api(
 #  PHASE 3 — SeleniumBase UC Browser Automation
 # ══════════════════════════════════════════════════════════════════════════════
 
+import threading as _threading
+import time as _time
+
+# ── Process-level WAF token cache ─────────────────────────────────────────────
+# Shared across ALL parallel worker threads. Keyed by proxy to avoid IP mismatch.
+# Token is invalidated on HTTP 202 (WAF re-challenge) or after WAF_TOKEN_TTL seconds.
+_WAF_TOKEN_CACHE: dict = {}  # proxy -> {"token": ..., "ts": ...}
+_WAF_TOKEN_LOCK = _threading.Lock()
+WAF_TOKEN_TTL = 1800  # 30 minutes — AWS WAF tokens typically last 30-60 min
+
+
+def _get_cached_waf_token(log, proxy: str | None = None) -> str | None:
+    """Return a cached WAF token if still fresh, else None."""
+    with _WAF_TOKEN_LOCK:
+        entry = _WAF_TOKEN_CACHE.get(proxy, {})
+        tok = entry.get("token")
+        age = _time.time() - entry.get("ts", 0.0)
+        if tok and age < WAF_TOKEN_TTL:
+            log.info(
+                f"  [WAF Cache] ♻️  Reusing cached aws-waf-token (age {age:.0f}s): {tok[:20]}..."
+            )
+            return tok
+    return None
+
+
+def _set_cached_waf_token(token: str, proxy: str | None = None) -> None:
+    """Store a freshly extracted WAF token in the cache."""
+    with _WAF_TOKEN_LOCK:
+        _WAF_TOKEN_CACHE[proxy] = {"token": token, "ts": _time.time()}
+
+
+def _invalidate_waf_token_cache(proxy: str | None = None) -> None:
+    """Force-expire the cache (called on HTTP 202 re-challenge)."""
+    with _WAF_TOKEN_LOCK:
+        _WAF_TOKEN_CACHE.pop(proxy, None)
 
 
 class DeepSeekAPI:
     """Pure API-based DeepSeek account creation (Bypasses Selenium)."""
-    def __init__(self, debug: bool = False):
+
+    def __init__(self, debug: bool = False, proxy: str | None = None):
         self.debug = debug
+        self.proxy = proxy
+        self.local_forwarder = None
+        self.sb_proxy = proxy
+        if self.proxy and "@" in self.proxy:
+            try:
+                from .local_proxy import LocalProxyForwarder
+            except ImportError:
+                import sys
+                from pathlib import Path
+
+                sys.path.append(str(Path(__file__).parent))
+                from local_proxy import LocalProxyForwarder
+            self.local_forwarder = LocalProxyForwarder(self.proxy)
+            self.sb_proxy = f"127.0.0.1:{self.local_forwarder.port}"
+
         import requests
+
         self.client = requests.Session()
-        self.client.headers.update({
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-            "content-type": "application/json",
-            "origin": "https://platform.deepseek.com",
-            "referer": "https://platform.deepseek.com/sign_up",
-        })
+        if self.proxy:
+            # requests expects http/https dict. Ensure proxy string has scheme.
+            p_url = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+            self.client.proxies.update({"http": p_url, "https": p_url})
+        self.client.headers.update(
+            {
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "content-type": "application/json",
+                "origin": "https://platform.deepseek.com",
+                "referer": "https://platform.deepseek.com/sign_up",
+            }
+        )
 
     def _generate_device_id(self) -> str:
         import secrets
         import base64
-        return base64.b64encode(secrets.token_bytes(64)).decode('utf-8')
+
+        return base64.b64encode(secrets.token_bytes(64)).decode("utf-8")
 
     def signup(self, email: str, password: str, otp_callback, seed_callback=None) -> str | None:
         """
-        Register a new DeepSeek account via platform API.
-        Returns None — caller must use signin() afterwards to get the chat token
-        (the platform register token != chat token; WAF on chat.deepseek.com
-        requires a browser for the first login).
+        Register a new DeepSeek account.
+        Uses a headless browser to solve WAF and get risk cookies (thumbcache),
+        then executes JS fetch() to call the registration endpoints.
         """
         import sys, os, json, base64, asyncio, time
+
         try:
             from deepseek_python_api.pow import DeepSeekHashSolver, Challenge
         except ImportError:
-            sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+            sys.path.insert(
+                0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+            )
             from deepseek_python_api.pow import DeepSeekHashSolver, Challenge
 
-        if seed_callback: seed_callback()
-        device_id = self._generate_device_id()
+        if seed_callback:
+            seed_callback()
+
         import logging
+
         log = logging.getLogger("deepseek_signup")
-        log.info(f"Starting API signup → {email}")
+        log.info(f"Starting browser-assisted API signup → {email}")
 
-        # Step 1: Request OTP
-        res = self.client.post(
-            "https://platform.deepseek.com/auth-api/v0/users/create_email_verification_code",
-            json={"email": email, "turnstile_token": "", "locale": "en_US",
-                  "device_id": device_id, "scenario": "register"},
-        )
-        if res.status_code != 200 or res.json().get("code") != 0:
-            log.error(f"Failed to send OTP via API: {res.text}")
+        from seleniumbase import SB
+
+        with SB(
+            test=False,
+            uc=True,
+            headless=True,  # Chrome --headless=new: no display/Xvfb needed, passes AWS WAF
+            xvfb=False,
+            proxy=self.sb_proxy,
+            chromium_arg="--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled",
+        ) as sb:
+            log.info("  Loading https://platform.deepseek.com/sign_up to solve WAF...")
+            sb.uc_open_with_reconnect("https://platform.deepseek.com/sign_up", reconnect_time=4)
+            sb.sleep(4)
+
+            # Step 1: Request OTP
+            # Get device_id from the thumbcache cookie
+            cookies = sb.driver.get_cookies()
+            device_id = ""
+            for c in cookies:
+                if c["name"].startswith(".thumbcache_"):
+                    import urllib.parse
+
+                    device_id = "B" + urllib.parse.unquote(c["value"])
+                    break
+            if not device_id:
+                log.warning("  Could not find thumbcache cookie. Generating random device_id.")
+                device_id = self._generate_device_id()
+
+            log.info("  Sending OTP via browser fetch...")
+            otp_res = sb.execute_async_script(f"""
+                var callback = arguments[arguments.length - 1];
+                fetch("https://platform.deepseek.com/auth-api/v0/users/create_email_verification_code", {{
+                    method: "POST",
+                    headers: {{"Content-Type": "application/json", "Accept": "*/*"}},
+                    body: JSON.stringify({{
+                        "email": "{email}", "turnstile_token": "", "locale": "en_US",
+                        "device_id": "{device_id}", "scenario": "register"
+                    }})
+                }}).then(r => r.json()).then(callback).catch(e => callback({{error: e.message}}));
+            """)
+            if otp_res.get("code") != 0:
+                log.error(f"Failed to send OTP via API: {otp_res}")
+                return None
+
+            log.info("  OTP sent. Waiting for email...")
+            try:
+                otp = otp_callback()
+            except TimeoutError:
+                return None
+
+            # Step 2: Solve PoW challenge
+            log.info("  Requesting PoW challenge...")
+            chal_res = sb.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                fetch("https://platform.deepseek.com/auth-api/v0/users/create_guest_challenge", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json", "Accept": "*/*"},
+                    body: JSON.stringify({"target_path": "/auth-api/v0/users/register"})
+                }).then(r => r.json()).then(callback).catch(e => callback({error: e.message}));
+            """)
+            challenge_b64 = chal_res["data"]["biz_data"]["guest_challenge"]
+            challenge = Challenge.from_payload(challenge_b64)
+            solver = DeepSeekHashSolver()
+            b64_full = asyncio.run(solver.create_answer(challenge, "/auth-api/v0/users/register"))
+            full_pow = json.loads(base64.b64decode(b64_full).decode())
+            pow_header = base64.b64encode(
+                json.dumps(
+                    {"salt": full_pow["salt"], "answer": full_pow["answer"]}, separators=(",", ":")
+                ).encode()
+            ).decode()
+            solver.close()
+
+            # Step 3: Register
+            log.info("  Registering account...")
+            reg_res = sb.execute_async_script(f"""
+                var callback = arguments[arguments.length - 1];
+                fetch("https://platform.deepseek.com/auth-api/v0/users/register", {{
+                    method: "POST",
+                    headers: {{
+                        "Content-Type": "application/json", 
+                        "Accept": "*/*",
+                        "x-ds-guest-pow-response": "{pow_header}"
+                    }},
+                    body: JSON.stringify({{
+                        "locale": "en_US", "region": "VN",
+                        "payload": {{"email": "{email}", "email_verification_code": "{otp}", "password": "{password}"}},
+                        "device_id": "{device_id}", "os": "web"
+                    }})
+                }}).then(r => r.json()).then(callback).catch(e => callback({{error: e.message}}));
+            """)
+
+            biz_code = (reg_res.get("data", {}) or {}).get("biz_code", -1)
+            if reg_res.get("code") != 0 or biz_code != 0:
+                log.error(f"Registration failed: {reg_res}")
+                return None
+
+            log.info("  ✓ Account registered successfully via browser fetch!")
+            # Return None to force `create_one_account` to execute the signin() phase
             return None
 
-        log.info("OTP sent via API. Waiting for email...")
+    def signin(
+        self, email: str, password: str, otp_callback=None, seed_callback=None
+    ) -> str | None:
+        """
+        Sign in to chat.deepseek.com and return the Chat Token.
+
+        Strategy:
+          1. Check process-level WAF token cache (free, instant).
+          2. If cached: try pure HTTP POST login with requests (fast, ~0.3s).
+             On 202 (re-challenge), invalidate cache and fall through to step 3.
+          3. Open one headless browser on chat.deepseek.com (solves WAF),
+             then perform login via in-browser JS fetch() — no separate HTTP
+             transport needed. Cookies are already present in the browser.
+        """
+        import logging
+
+        log = logging.getLogger("deepseek_signup")
+        log.info(f"Signing in: {email}")
+        device_id = self._generate_device_id()
+
+        # ── Fast path: use cached WAF token + pure HTTP POST ─────────────────
+        cached_waf = _get_cached_waf_token(log, proxy=self.proxy)
+        if cached_waf:
+            token = self._http_login(email, password, device_id, cached_waf, log)
+            if token:
+                return token
+            # Cache was stale / 202 — fall through to browser
+
+        # ── Reliable path: one browser open, WAF + login in one session ──────
+        return self._browser_signin(email, password, device_id, log)
+
+    def _http_login(
+        self, email: str, password: str, device_id: str, waf_token: str, log
+    ) -> str | None:
+        """Attempt login via pure HTTP POST using an existing WAF token.
+        Returns the chat token on success, or None on failure/202."""
+        import requests
+
+        log.info(f"  ♻️  WAF token cached ({len(waf_token)} chars) — trying fast HTTP login...")
+        session = requests.Session()
+        if self.proxy:
+            p_url = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+            session.proxies.update({"http": p_url, "https": p_url})
+        session.headers.update(
+            {
+                "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+                "content-type": "application/json",
+                "accept": "*/*",
+                "origin": "https://chat.deepseek.com",
+                "referer": "https://chat.deepseek.com/sign_in",
+                "x-client-locale": "en_US",
+                "x-client-bundle-id": "com.deepseek.chat",
+                "x-client-version": "2.3.0",
+                "x-client-platform": "web",
+                "x-client-timezone-offset": "0",
+            }
+        )
+        session.cookies.set("aws-waf-token", waf_token, domain="chat.deepseek.com")
         try:
-            otp = otp_callback()
-        except TimeoutError:
-            return None
-
-        # Step 2: Solve PoW challenge
-        res = self.client.post(
-            "https://platform.deepseek.com/auth-api/v0/users/create_guest_challenge",
-            json={"target_path": "/auth-api/v0/users/register"},
-        )
-        challenge = Challenge.from_payload(res.json()["data"]["biz_data"]["guest_challenge"])
-        solver = DeepSeekHashSolver()
-        b64_full = asyncio.run(solver.create_answer(challenge, "/auth-api/v0/users/register"))
-        full_pow = json.loads(base64.b64decode(b64_full).decode())
-        pow_header = base64.b64encode(
-            json.dumps({"salt": full_pow["salt"], "answer": full_pow["answer"]},
-                       separators=(',', ':')).encode()
-        ).decode()
-        solver.close()
-
-        # Step 3: Register
-        self.client.headers["x-ds-guest-pow-response"] = pow_header
-        res = self.client.post(
-            "https://platform.deepseek.com/auth-api/v0/users/register",
-            json={
-                "locale": "en_US", "region": "VN",
-                "payload": {"email": email, "email_verification_code": otp,
-                            "password": password},
-                "device_id": device_id, "os": "web",
-            },
-        )
-        if res.status_code != 200 or res.json().get("code") != 0:
-            log.error(f"Registration failed: {res.text}")
-            return None
-        log.info("✓ Account registered via API!")
-        # Return None — signin() is needed to get the chat.deepseek.com token.
+            resp = session.post(
+                "https://chat.deepseek.com/api/v0/users/login",
+                json={
+                    "email": email,
+                    "mobile": "",
+                    "password": password,
+                    "area_code": "",
+                    "device_id": device_id,
+                    "os": "web",
+                },
+                timeout=20,
+            )
+            log.info(f"  [HTTP Login] Response [{resp.status_code}]: {resp.text[:300]}")
+            if resp.status_code == 202:
+                log.warning("  HTTP 202 — WAF token expired. Invalidating cache.")
+                _invalidate_waf_token_cache(proxy=self.proxy)
+                return None
+            if resp.status_code == 200:
+                d = resp.json()
+                token = (((d.get("data") or {}).get("biz_data") or {}).get("user") or {}).get(
+                    "token"
+                )
+                if token and len(token) > 20:
+                    log.info(f"  ✅ Chat token via HTTP: {token[:12]}...")
+                    return token
+                log.warning(f"  Login 200 but no token: {resp.text[:200]}")
+            else:
+                log.warning(f"  HTTP login failed [{resp.status_code}]: {resp.text[:200]}")
+        except Exception as e:
+            log.warning(f"  HTTP login error: {e}")
         return None
 
-    def signin(self, email: str, password: str, otp_callback=None, seed_callback=None) -> str | None:
+    def _browser_signin(self, email: str, password: str, device_id: str, log) -> str | None:
         """
-        Sign in to chat.deepseek.com using a headless Selenium browser.
-        Pure HTTP login is blocked by AWS WAF (202 JS challenge), so we use a
-        lightweight SeleniumBase session just for the sign-in step.
-        Returns the chat token string or None.
+        Open chat.deepseek.com in a headless browser, solve the AWS WAF challenge,
+        cache the token, then POST login via in-browser JS fetch().
+        The WAF cookie is already in the browser — zero separate HTTP transport needed.
+        """
+        import json
+        from seleniumbase import SB
+
+        try:
+            with SB(
+                test=False,
+                uc=True,
+                headless=True,
+                xvfb=False,
+                proxy=self.sb_proxy,
+                chromium_arg=(
+                    "--no-sandbox,--disable-setuid-sandbox,"
+                    "--disable-dev-shm-usage,"
+                    "--disable-blink-features=AutomationControlled"
+                ),
+            ) as sb:
+                log.info("  [WAF] Loading chat.deepseek.com to solve WAF challenge...")
+                sb.uc_open_with_reconnect("https://chat.deepseek.com/sign_in", reconnect_time=4)
+                sb.sleep(4)
+
+                # Cache the WAF token for other workers
+                cookies = sb.driver.get_cookies()
+                waf = next((c["value"] for c in cookies if c["name"] == "aws-waf-token"), None)
+                if waf:
+                    log.info(f"  [WAF] ✓ Extracted aws-waf-token: {waf[:20]}...")
+                    _set_cached_waf_token(waf, proxy=self.proxy)
+                else:
+                    log.warning("  [WAF] aws-waf-token not found — proceeding anyway")
+
+                # Login POST via JS fetch() — WAF cookie already present in browser
+                payload = json.dumps(
+                    {
+                        "email": email,
+                        "mobile": "",
+                        "password": password,
+                        "area_code": "",
+                        "device_id": device_id,
+                        "os": "web",
+                    }
+                )
+                log.info("  [Browser Login] Posting login via JS fetch()...")
+                result = sb.execute_async_script(f"""
+                    var callback = arguments[arguments.length - 1];
+                    fetch("https://chat.deepseek.com/api/v0/users/login", {{
+                        method: "POST",
+                        headers: {{
+                            "Content-Type": "application/json",
+                            "Accept": "*/*",
+                            "x-client-locale": "en_US",
+                            "x-client-bundle-id": "com.deepseek.chat",
+                            "x-client-version": "2.3.0",
+                            "x-client-platform": "web"
+                        }},
+                        body: {repr(payload)}
+                    }}).then(r => r.json()).then(callback).catch(e => callback({{error: e.message}}));
+                """)
+                log.info(f"  [Browser Login] Response: {str(result)[:300]}")
+                if result and not result.get("error"):
+                    token = (
+                        ((result.get("data") or {}).get("biz_data") or {}).get("user") or {}
+                    ).get("token")
+                    if token and len(token) > 20:
+                        log.info(f"  ✅ Chat token via browser fetch: {token[:12]}...")
+                        return token
+                log.warning(f"  Browser login did not return a token: {result}")
+                return None
+        except Exception as e:
+            log.error(f"  Browser signin failed: {e}")
+            return None
+
+    def _extract_waf_token(self) -> str | None:
+        """
+        Obtain a valid aws-waf-token for chat.deepseek.com.
+
+        Strategy (fastest-first):
+          1. Process-level cache  — free, instant, shared across all threads
+          2. curl_cffi TLS spoof  — ~0.5s, no browser needed (may not work)
+          3. SeleniumBase browser — ~5-10s, guaranteed to work
+
+        Only strategy 3 opens a browser tab; strategies 1 & 2 are serverless.
         """
         import logging
+
         log = logging.getLogger("deepseek_signup")
-        log.info(f"Signing in (browser-assisted, headless): {email}")
-        sb_browser = DeepSeekBrowserSB(headless=True, debug=self.debug, manual_captcha=False)
-        return sb_browser.signin(
-            email=email,
-            password=password,
-            otp_callback=otp_callback,
-            seed_callback=seed_callback,
-        )
+
+        # ── Strategy 1: Process-level cache (free) ────────────────────────────
+        cached = _get_cached_waf_token(log, proxy=self.proxy)
+        if cached:
+            return cached
+
+        # ── Strategy 2: curl_cffi TLS fingerprint impersonation ───────────────
+        token = self._try_curlcffi_waf(log)
+        if token:
+            log.info(f"  [WAF] ✅ curl_cffi bypass succeeded — no browser needed!")
+            _set_cached_waf_token(token, proxy=self.proxy)
+            return token
+
+        # ── Strategy 3: Headless browser (guaranteed) ─────────────────────────
+        # Only one browser opens at a time (mutex), then result is cached for all
+        # subsequent workers in this batch.
+        with _WAF_TOKEN_LOCK:
+            # Re-check cache after acquiring lock (another thread may have just filled it)
+            entry = _WAF_TOKEN_CACHE.get(self.proxy, {})
+            cached = entry.get("token")
+            age = _time.time() - entry.get("ts", 0.0)
+            if cached and age < WAF_TOKEN_TTL:
+                log.info(
+                    f"  [WAF Cache] ♻️  Another thread extracted the token. Reusing: {cached[:20]}..."
+                )
+                return cached
+
+            token = self._browser_extract_waf_token(log)
+            if token:
+                _set_cached_waf_token(token, proxy=self.proxy)
+        return token
+
+    def _try_curlcffi_waf(self, log) -> str | None:
+        """Attempt to get aws-waf-token via curl_cffi TLS impersonation (no browser)."""
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            return None
+        try:
+            session = cffi_requests.Session(impersonate="chrome124")
+            if self.proxy:
+                p_url = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+                session.proxies.update({"http": p_url, "https": p_url})
+            r = session.get("https://chat.deepseek.com/sign_in", timeout=15, allow_redirects=True)
+            if r.status_code == 202:
+                log.debug(
+                    "  [WAF/curl_cffi] Got 202 — JS challenge required, curl_cffi insufficient"
+                )
+                return None
+            token = session.cookies.get("aws-waf-token")
+            if token:
+                log.info(f"  [WAF/curl_cffi] Got token: {token[:20]}...")
+            return token or None
+        except Exception as e:
+            log.debug(f"  [WAF/curl_cffi] Failed: {e}")
+            return None
+
+    def _browser_extract_waf_token(self, log) -> str | None:
+        """Open chat.deepseek.com in a headless browser, extract aws-waf-token only.
+        Used when we only need the token (e.g. to pre-warm the cache) without logging in."""
+        from seleniumbase import SB
+
+        try:
+            with SB(
+                test=False,
+                uc=True,
+                headless=True,
+                xvfb=False,
+                proxy=self.sb_proxy,
+                chromium_arg=(
+                    "--no-sandbox,"
+                    "--disable-setuid-sandbox,"
+                    "--disable-dev-shm-usage,"
+                    "--disable-blink-features=AutomationControlled"
+                ),
+            ) as sb:
+                log.info("  [WAF] Loading chat.deepseek.com to solve WAF challenge...")
+                sb.uc_open_with_reconnect("https://chat.deepseek.com/sign_in", reconnect_time=4)
+                sb.sleep(4)
+                cookies = sb.driver.get_cookies()
+                for c in cookies:
+                    if c.get("name") == "aws-waf-token":
+                        log.info(f"  [WAF] ✓ Extracted aws-waf-token: {c['value'][:20]}...")
+                        return c["value"]
+                log.warning("  [WAF] aws-waf-token not found in cookies after page load")
+                log.debug(f"  [WAF] Available cookies: {[c['name'] for c in cookies]}")
+                return None
+        except Exception as e:
+            log.warning(f"  [WAF] Browser WAF extraction failed: {e}")
+            return None
+
 
 class DeepSeekBrowserSB:
-
     """
     SeleniumBase UC (undetected-chromedriver) signup automation for platform.deepseek.com.
 
@@ -1285,12 +1713,30 @@ class DeepSeekBrowserSB:
     """
 
     def __init__(
-        self, headless: bool = False, debug: bool = False, manual_captcha: bool = False
+        self,
+        headless: bool = False,
+        debug: bool = False,
+        manual_captcha: bool = False,
+        proxy: str | None = None,
     ) -> None:
         self.headless = headless
         self.debug = debug
         self.manual_captcha = manual_captcha
         self._shot_idx = 0
+        self.proxy = proxy
+        self.local_forwarder = None
+        self.sb_proxy = proxy
+        if self.proxy and "@" in self.proxy:
+            try:
+                from .local_proxy import LocalProxyForwarder
+            except ImportError:
+                import sys
+                from pathlib import Path
+
+                sys.path.append(str(Path(__file__).parent))
+                from local_proxy import LocalProxyForwarder
+            self.local_forwarder = LocalProxyForwarder(self.proxy)
+            self.sb_proxy = f"127.0.0.1:{self.local_forwarder.port}"
 
     def _shot(self, sb, label: str) -> None:
         if not self.debug:
@@ -1451,8 +1897,11 @@ class DeepSeekBrowserSB:
             with SB(
                 test=False,
                 uc=True,
-                headless=False,
-                headless2=(False if self.manual_captcha else self.headless),
+                # manual_captcha forces headful so the user can see and interact;
+                # otherwise use Chrome --headless=new (no display/Xvfb needed)
+                headless=(False if self.manual_captcha else True),
+                xvfb=False,
+                proxy=self.sb_proxy,
                 chromium_arg=(
                     "--no-sandbox,"
                     "--disable-setuid-sandbox,"
@@ -1628,31 +2077,31 @@ class DeepSeekBrowserSB:
                     self._shot(sb, "error_otp_timeout")
 
                 if otp:
-                        otp_filled = False
-                        for sel in [
-                            "input[type='tel']",
-                            "input[placeholder='Code']",
-                            "input[placeholder='code']",
-                            "input[placeholder*='code' i]",
-                            "input[placeholder*='Code' i]",
-                            "input[placeholder*='OTP' i]",
-                            "input[maxlength='6']",
-                        ]:
-                            if self._js_set_value(sb, sel, otp):
-                                log.info(f"  ✓ OTP entered via JS ({sel})")
-                                otp_filled = True
-                                break
+                    otp_filled = False
+                    for sel in [
+                        "input[type='tel']",
+                        "input[placeholder='Code']",
+                        "input[placeholder='code']",
+                        "input[placeholder*='code' i]",
+                        "input[placeholder*='Code' i]",
+                        "input[placeholder*='OTP' i]",
+                        "input[maxlength='6']",
+                    ]:
+                        if self._js_set_value(sb, sel, otp):
+                            log.info(f"  ✓ OTP entered via JS ({sel})")
+                            otp_filled = True
+                            break
 
-                        if not otp_filled:
-                            # Try split digit inputs
-                            digit_count = sb.execute_script("""
+                    if not otp_filled:
+                        # Try split digit inputs
+                        digit_count = sb.execute_script("""
                                 return document.querySelectorAll(
                                     'input[maxlength="1"][type="text"], input[maxlength="1"]'
                                 ).length;
                             """)
-                            if digit_count == 6:
-                                otp_js = _json.dumps(list(otp))
-                                sb.execute_script(f"""
+                        if digit_count == 6:
+                            otp_js = _json.dumps(list(otp))
+                            sb.execute_script(f"""
                                     (function() {{
                                         const digits = {otp_js};
                                         const inputs = document.querySelectorAll(
@@ -1670,13 +2119,13 @@ class DeepSeekBrowserSB:
                                         }});
                                     }})()
                                 """)
-                                log.info("  ✓ OTP entered digit-by-digit")
-                                otp_filled = True
+                            log.info("  ✓ OTP entered digit-by-digit")
+                            otp_filled = True
 
-                        if not otp_filled:
-                            log.warning("  Could not find OTP input field.")
-                        sb.sleep(1)
-                        self._shot(sb, "05_otp_entered")
+                    if not otp_filled:
+                        log.warning("  Could not find OTP input field.")
+                    sb.sleep(1)
+                    self._shot(sb, "05_otp_entered")
 
                 # ── 8. Check ToS checkbox ─────────────────────────────────────
                 log.info("  Checking ToS checkbox (if any)...")
@@ -1745,8 +2194,14 @@ class DeepSeekBrowserSB:
                         log.info("  ✅ Token found!")
                         break
 
-                    if not redirected_to_chat and "platform.deepseek.com" in current_url and "/sign" not in current_url:
-                        log.info(f"  ✓ Signup succeeded! Navigating to chat.deepseek.com to get token...")
+                    if (
+                        not redirected_to_chat
+                        and "platform.deepseek.com" in current_url
+                        and "/sign" not in current_url
+                    ):
+                        log.info(
+                            f"  ✓ Signup succeeded! Navigating to chat.deepseek.com to get token..."
+                        )
                         sb.uc_open_with_reconnect("https://chat.deepseek.com", reconnect_time=4)
                         redirected_to_chat = True
                         continue
@@ -1766,7 +2221,9 @@ class DeepSeekBrowserSB:
 
         return token
 
-    def signin(self, email: str, password: str, otp_callback=None, seed_callback=None) -> str | None:
+    def signin(
+        self, email: str, password: str, otp_callback=None, seed_callback=None
+    ) -> str | None:
         """
         Sign in to an existing DeepSeek account via chat.deepseek.com.
         DeepSeek's email login sends an OTP — otp_callback is required for this.
@@ -1789,8 +2246,11 @@ class DeepSeekBrowserSB:
             with SB(
                 test=False,
                 uc=True,
-                headless=False,
-                headless2=(False if self.manual_captcha else self.headless),
+                # manual_captcha forces headful so the user can see and interact;
+                # otherwise use Chrome --headless=new (no display/Xvfb needed)
+                headless=(False if self.manual_captcha else True),
+                xvfb=False,
+                proxy=self.sb_proxy,
                 chromium_arg=(
                     "--no-sandbox,"
                     "--disable-setuid-sandbox,"
@@ -1798,12 +2258,14 @@ class DeepSeekBrowserSB:
                     "--disable-blink-features=AutomationControlled"
                 ),
             ) as sb:
-                # ── 1. Go directly to platform.deepseek.com/sign_in ───────────────
-                log.info("  Loading https://platform.deepseek.com/sign_in...")
-                sb.uc_open_with_reconnect("https://platform.deepseek.com/sign_in", reconnect_time=4)
+                # ── 1. Go directly to chat.deepseek.com/sign_in ───────────────
+                # chat.deepseek.com is where the chat token lives (userToken in localStorage).
+                # platform.deepseek.com gives a platform-only token that won't work with the proxy.
+                log.info("  Loading https://chat.deepseek.com/sign_in...")
+                sb.uc_open_with_reconnect("https://chat.deepseek.com/sign_in", reconnect_time=4)
                 sb.sleep(3)
                 sb.execute_script("try { localStorage.removeItem('userToken'); } catch(e) {}")
-                
+
                 self._handle_captcha(sb)
                 sb.sleep(1)
                 self._shot(sb, "signin_01_page")
@@ -1847,7 +2309,7 @@ class DeepSeekBrowserSB:
                     log.info("  ✓ Password filled via sb.type")
                 except Exception as _e:
                     log.info(f"  Password field not found: {_e} — assuming OTP-only flow")
-                
+
                 try:
                     self._js_set_value(sb, pass_sel, password)
                     log.info("  ✓ Password filled via JS fallback")
@@ -1868,7 +2330,8 @@ class DeepSeekBrowserSB:
                 try:
                     with open("page_source.html", "w", encoding="utf-8") as f:
                         f.write(sb.get_page_source())
-                except: pass
+                except:
+                    pass
                 # ── 8. Seed inbox before triggering OTP ───────────────────────
                 if seed_callback:
                     try:
@@ -1897,35 +2360,60 @@ class DeepSeekBrowserSB:
 
                 self._shot(sb, "signin_02b_pre_click")
 
-                # Click the Log in button using React internal props or SeleniumBase
+                # Submit the login form — strategies in reliability order:
+                # 1. uc_click (CDP-level real mouse click at element coordinates)
+                # 2. Press Enter on password field
+                # 3. JS .click()
+                # 4. form.submit() as last resort
                 clicked = None
-                for text in ["Log in", "Continue", "Sign in", "登录", "Đăng nhập"]:
+
+                # Strategy 1: uc_click — fires a real CDP DispatchMouseEvent
+                for text in ["Log in", "Continue", "Sign in", "登录"]:
                     try:
-                        # React internal hack
-                        sb.execute_script(f"""
-                            const btns = document.querySelectorAll("div.ds-button, button");
+                        btn_sel = (
+                            f'button:contains("{text}"), div[role="button"]:contains("{text}")'
+                        )
+                        sb.uc_click(btn_sel, timeout=4)
+                        log.info(f"  ✓ uc_click: '{text}'")
+                        clicked = f"uc:{text}"
+                        break
+                    except Exception as _e:
+                        log.debug(f"  uc_click '{text}' failed: {_e}")
+
+                if not clicked:
+                    # Strategy 2: Press Enter on password field
+                    try:
+                        sb.press_keys(pass_sel, "\n")
+                        log.info("  ✓ Submitted via Enter on password field")
+                        clicked = "enter"
+                    except Exception as _e:
+                        log.debug(f"  Enter on password failed: {_e}")
+
+                if not clicked:
+                    # Strategy 3: JS .click()
+                    for text in ["Log in", "Continue", "Sign in", "登录"]:
+                        res = sb.execute_script(f"""
+                            const btns = document.querySelectorAll("button, div[role='button']");
                             for (let btn of btns) {{
-                                if ((btn.textContent || '').trim().toLowerCase().includes("{text}".toLowerCase())) {{
-                                    const key = Object.keys(btn).find(k => k.startsWith("__reactProps$"));
-                                    if (key && btn[key] && btn[key].onClick) {{
-                                        btn[key].onClick({{ preventDefault: () => {{}}, stopPropagation: () => {{}} }});
-                                        return true;
-                                    }}
+                                if ((btn.textContent || '').trim().toLowerCase().includes("{text.lower()}")) {{
                                     btn.click();
-                                    return true;
+                                    return 'js:' + btn.textContent.trim().slice(0, 20);
                                 }}
                             }}
-                            return false;
+                            return null;
                         """)
-                        # Fallback to real CDP click
-                        sb.click(f'div.ds-button:contains("{text}"), button:contains("{text}")', timeout=2)
-                        log.info(f"  ✓ Clicked button with text: {text}")
-                        clicked = text
-                        break
-                    except Exception:
-                        continue
+                        if res:
+                            log.info(f"  ✓ JS click: {res}")
+                            clicked = res
+                            break
 
-                log.info(f"  Final click result: {clicked}")
+                if not clicked:
+                    # Strategy 4: form.submit()
+                    sb.execute_script("const f=document.querySelector('form'); if(f) f.submit();")
+                    clicked = "form.submit"
+                    log.info("  ✓ Submitted via form.submit()")
+
+                log.info(f"  Final submit result: {clicked}")
 
                 sb.sleep(2)
                 self._handle_captcha(sb)
@@ -2017,39 +2505,39 @@ class DeepSeekBrowserSB:
                     except TimeoutError as e:
                         log.warning(f"  OTP polling timed out during signin: {e}")
                 elif otp_input_sel and not otp_callback:
-                    log.warning("  OTP input found but no otp_callback provided — cannot complete signin.")
+                    log.warning(
+                        "  OTP input found but no otp_callback provided — cannot complete signin."
+                    )
 
-                # ── 11. Wait for redirect and scan for token ──────────────────
-                log.info("  Waiting for token in chat.deepseek.com storage...")
-                redirected_to_chat = False
-                for attempt in range(20):
+                # ── 11. Wait for token in chat.deepseek.com storage ──────────
+                # Since we're already on chat.deepseek.com, userToken should appear
+                # in localStorage after successful login.
+                log.info("  Waiting for token in localStorage...")
+                redirected_to_chat = True  # We're already on chat.deepseek.com
+                for attempt in range(25):
                     if attempt == 5:
                         sb.save_screenshot("debug_login.png")
                         log.info("  Saved screenshot to debug_login.png")
                         try:
                             with open("debug_login.html", "w", encoding="utf-8") as f:
                                 f.write(sb.get_page_source())
-                        except: pass
-                    
+                        except:
+                            pass
+
                     token = _scan_storage_for_token(sb.driver)
                     if token:
                         log.info("  ✅ Token found!")
                         break
-                    
-                    current_url = sb.get_current_url()
-                    log.debug(f"  [{attempt+1}/20] URL: {current_url[:80]}")
-                    
-                    # If we are on platform.deepseek.com and no longer on the signin page
-                    if not redirected_to_chat and "platform.deepseek.com" in current_url and "/sign" not in current_url:
-                        log.info(f"  ✓ Signin succeeded! Navigating to chat.deepseek.com to get token...")
-                        sb.uc_open_with_reconnect(DEEPSEEK_CHAT_URL, reconnect_time=4)
-                        redirected_to_chat = True
-                        sb.sleep(3)
-                        continue
 
-                    # If we somehow landed somewhere else
-                    if "chat.deepseek.com" not in current_url and "platform.deepseek.com" not in current_url:
-                        log.info("  Navigating back to chat.deepseek.com...")
+                    current_url = sb.get_current_url()
+                    log.debug(f"  [{attempt + 1}/25] URL: {current_url[:80]}")
+
+                    # If somehow we got redirected back to platform, grab the session and
+                    # navigate to chat.deepseek.com to extract the token
+                    if "platform.deepseek.com" in current_url and "/sign" not in current_url:
+                        log.info(
+                            "  Detected platform redirect — navigating to chat.deepseek.com..."
+                        )
                         sb.uc_open_with_reconnect(DEEPSEEK_CHAT_URL, reconnect_time=4)
                         sb.sleep(3)
                         continue
@@ -2077,6 +2565,7 @@ def create_one_account(
     api_url: str | None = None,
     api_key: str | None = None,
     use_api_mode: bool = False,
+    proxy: ProxyConfig | None = None,
 ) -> dict | None:
     """
     Full account creation flow:
@@ -2096,6 +2585,14 @@ def create_one_account(
     email = mail.address
     password = mail.password
 
+    # Step 1.5: If proxy is a rotating proxy, perform patient rotation
+    actual_proxy_url: str | None = None
+    if isinstance(proxy, SyncRotatingProxy):
+        proxy.wait_and_rotate(log)
+        actual_proxy_url = proxy.proxy_url
+    else:
+        actual_proxy_url = proxy
+
     # Generate a strong password
     ds_pw = (
         "".join(random.choices(string.ascii_uppercase, k=2))
@@ -2106,9 +2603,12 @@ def create_one_account(
     log.info(f"  DeepSeek password will be: {ds_pw}")
 
     if use_api_mode:
-        browser = DeepSeekAPI(debug=debug)
+        browser = DeepSeekAPI(debug=debug, proxy=actual_proxy_url)
     else:
+        # Pass proxy to DeepSeekBrowserSB if it exists
         browser = DeepSeekBrowserSB(headless=headless, debug=debug, manual_captcha=manual_captcha)
+        if hasattr(browser, "proxy"):
+            browser.proxy = actual_proxy_url
 
     # For GraphAPIMailAdapter, pass plus-address filter so parallel workers
     # don't accidentally steal each other's OTPs.
@@ -2141,6 +2641,7 @@ def create_one_account(
                 name=f"auto-{acc['email']}",
                 api_url=api_url,
                 api_key=api_key or DEFAULT_API_KEY,
+                proxy=proxy,
             )
         return acc
 
@@ -2179,6 +2680,7 @@ def create_accounts_parallel(
     api_key: str | None = None,
     use_api_mode: bool = False,
     max_workers: int = 10,
+    proxies: list[ProxyConfig] | None = None,
 ) -> list[dict]:
     """
     Create *count* accounts in parallel, up to *max_workers* at a time.
@@ -2205,7 +2707,8 @@ def create_accounts_parallel(
             manual_captcha=manual_captcha,
             api_url=api_url,
             api_key=api_key,
-            use_api_mode=use_api_mode,
+            use_api_mode=True,  # Always use the highly optimized Hybrid API mode
+            proxy=proxies[i % len(proxies)] if proxies else None,
         )
         if acc:
             with lock:
@@ -2263,6 +2766,13 @@ Examples:
         ),
     )
     parser.add_argument("--count", type=int, default=1, help="Number of accounts to create")
+    parser.add_argument(
+        "--plus",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Multiplier for GraphAPI emails. If set, --count is automatically calculated as (number of emails in pool * N).",
+    )
     parser.add_argument("--headless", action="store_true", help="Run browser headlessly")
     parser.add_argument(
         "--manual-captcha",
@@ -2324,6 +2834,20 @@ Examples:
         metavar="FILE",
         help="Path to a file containing Graph API credentials, one per line "
         "(email|pass|refresh_token[|client_id]). Comments (#) are ignored.",
+    )
+    # Proxy support
+    parser.add_argument(
+        "--proxies",
+        action="append",
+        default=[],
+        metavar="HOST:PORT or USER:PASS@HOST:PORT",
+        help="Proxy string to use for signup. Repeat to add multiple proxies (used round-robin).",
+    )
+    parser.add_argument(
+        "--proxies-file",
+        default="",
+        metavar="FILE",
+        help="Path to a file containing proxy strings, one per line. Comments (#) are ignored.",
     )
     args = parser.parse_args()
 
@@ -2430,6 +2954,13 @@ Examples:
         _GRAPHAPI_IDX = 0
         emails = ", ".join(c["email"] for c in _GRAPHAPI_POOL)
         log.info(f"  Graph API pool: {len(_GRAPHAPI_POOL)} account(s) — {emails}")
+
+        if args.plus > 0:
+            args.count = len(_GRAPHAPI_POOL) * args.plus
+            log.info(
+                f"  --plus {args.plus} specified. Total accounts to create set to: {args.count}"
+            )
+
     elif args.mail_service == "graphapi":
         parser.error(
             "--mail-service graphapi requires at least one credential.\n"
@@ -2455,6 +2986,49 @@ Examples:
         except Exception:
             pass
 
+    # ── Proxies ───────────────────────────────────────────────────────────────
+    
+    def _parse_cli_proxy(line: str) -> ProxyConfig | None:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        lower = line.lower()
+        if lower.startswith("rotating:"):
+            body = line[len("rotating:"):].strip()
+            segments = [s.strip() for s in body.split("|")]
+            proxy_url = segments[0]
+            params = {}
+            for seg in segments[1:]:
+                if "=" in seg:
+                    k, _, v = seg.partition("=")
+                    params[k.strip().lower()] = v.strip()
+            rotate_url = params.get("rotate_url")
+            if not rotate_url:
+                log.warning(f"Rotating proxy line missing rotate_url: {line}")
+                return proxy_url
+            min_interval = float(params.get("min_interval", "61.0"))
+            return SyncRotatingProxy(proxy_url, rotate_url, min_interval)
+        return line
+
+    proxy_pool: list[ProxyConfig] = []
+    for p in args.proxies:
+        parsed = _parse_cli_proxy(p)
+        if parsed:
+            proxy_pool.append(parsed)
+
+    if args.proxies_file:
+        pf = Path(args.proxies_file)
+        if pf.exists():
+            for line in pf.read_text(encoding="utf-8").splitlines():
+                parsed = _parse_cli_proxy(line)
+                if parsed:
+                    proxy_pool.append(parsed)
+        else:
+            log.warning(f"Proxies file not found: {pf}")
+
+    if proxy_pool:
+        log.info(f"Loaded {len(proxy_pool)} proxy(s) for requests.")
+
     common_kwargs = dict(
         mail_service=args.mail_service,
         headless=args.headless,
@@ -2462,11 +3036,13 @@ Examples:
         manual_captcha=args.manual_captcha,
         api_url=api_url,
         api_key=api_key,
-        use_api_mode=args.api_mode,
+        use_api_mode=True,
     )
 
     if args.parallel > 1:
-        log.info(f"\n🚀 Parallel mode: {args.count} account(s) in batches of {args.parallel} workers")
+        log.info(
+            f"\n🚀 Parallel mode: {args.count} account(s) in batches of {args.parallel} workers"
+        )
         if args.mail_service != "graphapi":
             log.warning(
                 "⚠  --parallel works best with --mail-service graphapi (plus-addressing). "
@@ -2476,6 +3052,7 @@ Examples:
             args.count,
             **common_kwargs,
             max_workers=args.parallel,
+            proxies=proxy_pool if proxy_pool else None,
         )
         results.extend(new_results)
         out_path.write_text(json.dumps(results, indent=2))
@@ -2485,7 +3062,10 @@ Examples:
             log.info(f"  Account {i + 1}/{args.count}")
             log.info(f"{'=' * 60}")
 
-            acc = create_one_account(**common_kwargs)
+            kwargs = dict(common_kwargs)
+            if proxy_pool:
+                kwargs["proxy"] = proxy_pool[i % len(proxy_pool)]
+            acc = create_one_account(**kwargs)
 
             if acc:
                 results.append(acc)

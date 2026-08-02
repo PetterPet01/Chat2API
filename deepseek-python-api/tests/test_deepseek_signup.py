@@ -21,15 +21,14 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests as req
 
 # Put the scripts dir on the path so we can import deepseek_signup directly
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-import deepseek_signup as ds  # noqa: E402
-
+import deepseek_signup as ds
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OTP extraction
@@ -117,31 +116,7 @@ class TestExtractVerificationLink:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestFindDeepSeekTokenInStr:
-    def test_base64_token(self):
-        token = "U4vsCtoBdxn1pfU4QclHNg2M9rVtBq82giPe2ilrFBfeiuR4yLj+mW31jjPIUl7z"
-        assert ds._find_deepseek_token_in_str(token) == token
 
-    def test_jwt_token(self):
-        jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-        result = ds._find_deepseek_token_in_str(jwt)
-        assert result is not None
-        assert result.startswith("eyJ")
-
-    def test_short_string_returns_none(self):
-        assert ds._find_deepseek_token_in_str("abc123") is None
-
-    def test_empty_string(self):
-        assert ds._find_deepseek_token_in_str("") is None
-
-    def test_none_input(self):
-        assert ds._find_deepseek_token_in_str(None) is None
-
-    def test_token_embedded_in_json(self):
-        token = "U4vsCtoBdxn1pfU4QclHNg2M9rVtBq82giPe2ilrFBfeiuR4yLj"
-        text = json.dumps({"userToken": token})
-        result = ds._find_deepseek_token_in_str(text)
-        assert result is not None
 
 
 class TestSearchDictForToken:
@@ -991,18 +966,13 @@ class TestGraphAPIPool:
         self._make_pool(["only@hotmail.com"])
         selected = []
         for _ in range(3):
-            factory = (
-                ds._create_mail_backend.__wrapped__
-                if hasattr(ds._create_mail_backend, "__wrapped__")
-                else None
-            )
             # We verify by checking the email the adapter was constructed with
             with patch.object(ds, "GraphAPIMailAdapter") as MockAdapter:
                 mock_inst = MagicMock()
                 mock_inst.address = "only@hotmail.com"
                 mock_inst.create_account = MagicMock(return_value=("only@hotmail.com", ""))
                 MockAdapter.return_value = mock_inst
-                result = ds._create_mail_backend("graphapi")
+                ds._create_mail_backend("graphapi")
             call_kwargs = MockAdapter.call_args.kwargs
             selected.append(call_kwargs.get("email", ""))
         assert all(e == "only@hotmail.com" for e in selected)
@@ -1061,7 +1031,7 @@ class TestGraphAPIPool:
             line = line.strip()
             if line and not line.startswith("#"):
                 lines.append(line)
-        parsed = [ds.parse_graphapi_credential(l) for l in lines]
+        parsed = [ds.parse_graphapi_credential(line) for line in lines]
         assert len(parsed) == 3
         assert parsed[0]["email"] == "first@hotmail.com"
         assert parsed[1]["client_id"] == ds.MS_DEFAULT_CLIENT_ID
@@ -1162,7 +1132,8 @@ class TestGraphAPIMailAdapter:
 
     def test_init_sets_address_and_password(self):
         adapter = self._make_adapter()
-        assert adapter.address == self.SAMPLE_EMAIL
+        assert adapter.address.startswith(self.SAMPLE_EMAIL.split("@")[0])
+        assert adapter.address.endswith("@hotmail.com")
         assert adapter.password == self.SAMPLE_PASSWORD
 
     def test_default_client_id_used_when_not_provided(self):
@@ -1205,7 +1176,7 @@ class TestGraphAPIMailAdapter:
             addr, pwd = adapter.create_account()
         mock_refresh.assert_called_once()
         mock_get.assert_called_once()
-        assert addr == self.SAMPLE_EMAIL
+        assert addr.startswith(self.SAMPLE_EMAIL.split("@")[0])
         assert pwd == self.SAMPLE_PASSWORD
 
     def test_poll_for_otp_finds_code_in_first_message(self):
@@ -1269,7 +1240,9 @@ class TestGraphAPIMailAdapter:
                 "id": "msg-link",
                 "subject": "Verify your DeepSeek account",
                 "body": {
-                    "content": "Click https://platform.deepseek.com/verify?token=abc123 to confirm.",
+                    "content": (
+                        "Click https://platform.deepseek.com/verify?token=abc123 to confirm."
+                    ),
                     "contentType": "text",
                 },
                 "bodyPreview": "",
