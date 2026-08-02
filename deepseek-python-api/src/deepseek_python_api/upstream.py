@@ -50,6 +50,7 @@ FAKE_HEADERS = {
 class TokenCacheEntry:
     access_token: str
     expires_at: float
+    proxy_url: str | None = None
 
 
 class DeepSeekStream:
@@ -60,12 +61,14 @@ class DeepSeekStream:
         client: DeepSeekClient,
         session_id: str,
         user_token: str,
+        proxy_url: str | None = None,
     ) -> None:
         self._response_context = response_context
         self.response = response
         self._client = client
         self.session_id = session_id
         self._user_token = user_token
+        self._proxy_url = proxy_url
         self._closed = False
 
     async def iter_bytes(self) -> AsyncIterator[bytes]:
@@ -78,7 +81,7 @@ class DeepSeekStream:
         self._closed = True
         await self._response_context.__aexit__(None, None, None)
         if self._client.settings.delete_sessions:
-            await self._client.delete_session(self.session_id, self._user_token)
+            await self._client.delete_session(self.session_id, self._user_token, self._proxy_url)
 
 
 class DeepSeekClient:
@@ -94,20 +97,47 @@ class DeepSeekClient:
         self._pow = pow_solver
         self._tokens: dict[str, TokenCacheEntry] = {}
         self._token_locks: dict[str, asyncio.Lock] = {}
+        self._proxy_clients: dict[str, httpx.AsyncClient] = {}
         self._image_loader = ImageLoader(http_client, settings)
 
-    async def acquire_token(self, user_token: str, *, force_refresh: bool = False) -> str:
+    def _client_for_proxy(self, proxy_url: str | None) -> httpx.AsyncClient:
+        if not proxy_url:
+            return self._http
+        client = self._proxy_clients.get(proxy_url)
+        if client is None:
+            client = httpx.AsyncClient(proxy=proxy_url)
+            self._proxy_clients[proxy_url] = client
+        return client
+
+    async def aclose(self) -> None:
+        for client in self._proxy_clients.values():
+            await client.aclose()
+        self._proxy_clients.clear()
+
+    async def acquire_token(
+        self, user_token: str, *, force_refresh: bool = False, proxy_url: str | None = None
+    ) -> str:
         cached = self._tokens.get(user_token)
-        if not force_refresh and cached and cached.expires_at > time.monotonic():
+        if (
+            not force_refresh
+            and cached
+            and cached.expires_at > time.monotonic()
+            and cached.proxy_url == proxy_url
+        ):
             return cached.access_token
 
         lock = self._token_locks.setdefault(user_token, asyncio.Lock())
         async with lock:
             cached = self._tokens.get(user_token)
-            if not force_refresh and cached and cached.expires_at > time.monotonic():
+            if (
+                not force_refresh
+                and cached
+                and cached.expires_at > time.monotonic()
+                and cached.proxy_url == proxy_url
+            ):
                 return cached.access_token
 
-            response = await self._http.get(
+            response = await self._client_for_proxy(proxy_url).get(
                 self._api_url("/api/v0/users/current"),
                 headers=self._headers(user_token),
                 timeout=self.settings.connect_timeout_seconds,
@@ -127,6 +157,7 @@ class DeepSeekClient:
             self._tokens[user_token] = TokenCacheEntry(
                 access_token=access_token,
                 expires_at=time.monotonic() + self.settings.access_token_ttl_seconds,
+                proxy_url=proxy_url,
             )
             return access_token
 
@@ -134,8 +165,8 @@ class DeepSeekClient:
         self._tokens.pop(user_token, None)
         self._token_locks.pop(user_token, None)
 
-    async def create_session(self, access_token: str) -> str:
-        response = await self._http.post(
+    async def create_session(self, access_token: str, proxy_url: str | None = None) -> str:
+        response = await self._client_for_proxy(proxy_url).post(
             self._api_url("/api/v0/chat_session/create"),
             json={},
             headers=self._headers(access_token, cookie=True),
@@ -154,10 +185,12 @@ class DeepSeekClient:
             )
         return session_id
 
-    async def delete_session(self, session_id: str, user_token: str | None = None) -> bool:
+    async def delete_session(
+        self, session_id: str, user_token: str | None = None, proxy_url: str | None = None
+    ) -> bool:
         try:
             token = (
-                await self.acquire_token(user_token)
+                await self.acquire_token(user_token, proxy_url=proxy_url)
                 if user_token
                 else next(
                     (
@@ -170,7 +203,7 @@ class DeepSeekClient:
             )
             if not token:
                 return False
-            response = await self._http.post(
+            response = await self._client_for_proxy(proxy_url).post(
                 self._api_url("/api/v0/chat_session/delete"),
                 json={"chat_session_id": session_id},
                 headers=self._headers(token),
@@ -181,11 +214,13 @@ class DeepSeekClient:
             LOGGER.warning("Best-effort DeepSeek session cleanup failed", exc_info=True)
             return False
 
-    async def get_challenge(self, access_token: str, target_path: str) -> Challenge:
+    async def get_challenge(
+        self, access_token: str, target_path: str, proxy_url: str | None = None
+    ) -> Challenge:
         last_error: Exception | None = None
         for attempt in range(self.settings.challenge_retry_attempts):
             try:
-                response = await self._http.post(
+                response = await self._client_for_proxy(proxy_url).post(
                     self._api_url("/api/v0/chat/create_pow_challenge"),
                     json={"target_path": target_path},
                     headers=self._headers(access_token),
@@ -209,7 +244,9 @@ class DeepSeekClient:
             "Failed to get DeepSeek proof-of-work challenge"
         ) from last_error
 
-    async def upload_images(self, image_urls: list[str], access_token: str) -> list[str]:
+    async def upload_images(
+        self, image_urls: list[str], access_token: str, proxy_url: str | None = None
+    ) -> list[str]:
         if len(image_urls) > self.settings.max_images:
             raise DeepSeekProxyError(
                 f"A maximum of {self.settings.max_images} images is supported",
@@ -220,13 +257,15 @@ class DeepSeekClient:
         file_ids: list[str] = []
         for image_url in image_urls:
             image = await self._image_loader.load(image_url)
-            file_ids.append(await self.upload_image(image, access_token))
+            file_ids.append(await self.upload_image(image, access_token, proxy_url))
         return file_ids
 
-    async def upload_image(self, image: ImageFile, access_token: str) -> str:
-        challenge = await self.get_challenge(access_token, FILE_UPLOAD_PATH)
+    async def upload_image(
+        self, image: ImageFile, access_token: str, proxy_url: str | None = None
+    ) -> str:
+        challenge = await self.get_challenge(access_token, FILE_UPLOAD_PATH, proxy_url)
         answer = await self._pow.create_answer(challenge, FILE_UPLOAD_PATH)
-        response = await self._http.post(
+        response = await self._client_for_proxy(proxy_url).post(
             self._api_url(FILE_UPLOAD_PATH),
             files={"file": (image.filename, image.data, image.mime_type)},
             headers=self._headers(
@@ -248,12 +287,14 @@ class DeepSeekClient:
         file_id = uploaded.get("id")
         if not isinstance(file_id, str):
             raise UpstreamProtocolError("DeepSeek vision upload response did not contain a file ID")
-        await self.wait_for_uploaded_file(file_id, access_token)
+        await self.wait_for_uploaded_file(file_id, access_token, proxy_url)
         return file_id
 
-    async def wait_for_uploaded_file(self, file_id: str, access_token: str) -> dict[str, Any]:
+    async def wait_for_uploaded_file(
+        self, file_id: str, access_token: str, proxy_url: str | None = None
+    ) -> dict[str, Any]:
         for attempt in range(self.settings.file_poll_attempts):
-            response = await self._http.get(
+            response = await self._client_for_proxy(proxy_url).get(
                 self._api_url(FILE_FETCH_PATH),
                 params={"file_ids": file_id},
                 headers=self._headers(access_token, cookie=True),
@@ -289,14 +330,17 @@ class DeepSeekClient:
         search_enabled: bool,
         thinking_enabled: bool,
         image_urls: list[str],
+        proxy_url: str | None = None,
     ) -> DeepSeekStream:
-        access_token = await self.acquire_token(user_token)
-        session_id = await self.create_session(access_token)
+        access_token = await self.acquire_token(user_token, proxy_url=proxy_url)
+        session_id = await self.create_session(access_token, proxy_url)
         try:
-            file_ids = await self.upload_images(image_urls, access_token) if image_urls else []
-            challenge = await self.get_challenge(access_token, CHAT_COMPLETION_PATH)
+            file_ids = (
+                await self.upload_images(image_urls, access_token, proxy_url) if image_urls else []
+            )
+            challenge = await self.get_challenge(access_token, CHAT_COMPLETION_PATH, proxy_url)
             answer = await self._pow.create_answer(challenge, CHAT_COMPLETION_PATH)
-            request_context = self._http.stream(
+            request_context = self._client_for_proxy(proxy_url).stream(
                 "POST",
                 self._api_url(CHAT_COMPLETION_PATH),
                 json={
@@ -328,10 +372,12 @@ class DeepSeekClient:
                     f"DeepSeek completion failed: HTTP {response.status_code} {body}".strip(),
                     status_code=502 if response.status_code >= 500 else response.status_code,
                 )
-            return DeepSeekStream(request_context, response, self, session_id, user_token)
+            return DeepSeekStream(
+                request_context, response, self, session_id, user_token, proxy_url
+            )
         except Exception:
             if self.settings.delete_sessions:
-                await self.delete_session(session_id, user_token)
+                await self.delete_session(session_id, user_token, proxy_url)
             raise
 
     def _api_url(self, target_path: str) -> str:

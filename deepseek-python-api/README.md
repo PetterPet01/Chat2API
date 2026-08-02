@@ -10,7 +10,7 @@ Standalone OpenAI-compatible Python server for DeepSeek's private web chat API, 
 - Streaming and non-streaming responses.
 - OpenAI-style multimodal `image_url` parts, including base64 data URLs and remote HTTP(S) images.
 - DeepSeek web-token exchange, per-request upstream session creation, best-effort session deletion, target-specific proof-of-work, image upload, file-status polling, and completion submission.
-- Managed multi-token store with CRUD APIs, redacted token views, health checks, cooldowns, fill-first routing, and round-robin routing.
+- Managed multi-token store with CRUD APIs, redacted token/proxy views, health checks, cooldowns, fill-first routing, and round-robin routing.
 - Dependency-free dashboard at `GET /dashboard` for token management, health checks, and rotation changes.
 - Optional local client-facing `API_KEY` separate from the DeepSeek upstream token.
 - Optional management-facing `MANAGEMENT_API_KEY` for `/v0/management/*`.
@@ -48,7 +48,8 @@ The service listens on `http://127.0.0.1:8000` by default.
 | `DEEPSEEK_AUTH_TOKEN` | unset | Static upstream DeepSeek browser/web token. Used only when no managed tokens are configured. |
 | `API_KEY` | unset | Optional client-facing API key for `/v1/*`. Do not reuse the DeepSeek token here. |
 | `MANAGEMENT_API_KEY` | unset | Optional management key for `/v0/management/*`; falls back to `API_KEY` if unset. |
-| `TOKENS_FILE` | `deepseek_tokens.json` | Local JSON store for managed DeepSeek tokens and rotation state. |
+| `TOKENS_FILE` | `deepseek_tokens.json` | Local JSON store for managed DeepSeek tokens, proxy assignments, and rotation state. |
+| `PROXIES_FILE` | `proxies.txt` | Proxy pool file. Entries use `HOST:PORT`, `USER:PASS@HOST:PORT`, or absolute `http://`/`https://` URLs, one per line. |
 | `ROTATION_STRATEGY` | `fill_first` | Managed-token strategy: `fill_first` or `round_robin`. |
 | `TOKEN_HEALTH_CHECK_INTERVAL_SECONDS` | `300` | Periodic health-check interval; set `0` to disable the background supervisor. |
 | `TOKEN_FAILURE_COOLDOWN_SECONDS` | `300` | Cooldown duration after a non-auth token failure. |
@@ -95,6 +96,8 @@ Management endpoints require `MANAGEMENT_API_KEY`, or `API_KEY` when no dedicate
 
 Managed tokens are persisted in `TOKENS_FILE` because the upstream web token must be replayed to DeepSeek. API responses and the dashboard never return raw token values; they expose only a short redaction and a SHA-256 fingerprint prefix. Keep the token store private, backed up carefully if needed, and out of git. The default local `deepseek_tokens.json` path is ignored by `.gitignore` and `.dockerignore`; the Docker image defaults to `/data/deepseek_tokens.json` so it can run as a non-root user with a mounted volume.
 
+If `PROXIES_FILE` exists, proxies are loaded from it at startup and assigned to managed tokens round-robin as tokens are added or migrated. The assigned proxy is persisted with each token for IP affinity and reused for DeepSeek upstream traffic, including web-token exchange, health checks, session create/delete, proof-of-work challenge requests, image upload/status polling, and completion requests. API responses and the dashboard only show redacted proxy values such as `http://***@proxy.example:8080`; proxy credentials remain only in the `0600` token store and the local proxy file. Signup uploads also pass the signup proxy to the management API so newly created accounts keep the same runtime proxy.
+
 Add a token:
 
 ```bash
@@ -102,6 +105,15 @@ curl -sS http://127.0.0.1:8000/v0/management/tokens \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <MANAGEMENT_API_KEY>' \
   -d '{"name":"primary","token":"<deepseek-web-token>","check":true}'
+```
+
+Optionally override the automatic proxy assignment while adding a token:
+
+```bash
+curl -sS http://127.0.0.1:8000/v0/management/tokens \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <MANAGEMENT_API_KEY>' \
+  -d '{"name":"primary","token":"<deepseek-web-token>","proxy":"user:pass@proxy.example:8080"}'
 ```
 
 List tokens:

@@ -5,7 +5,7 @@ export interface DeepSeekChatOptionInput {
 }
 
 export interface DeepSeekChatOptions {
-  modelType: 'default' | 'expert'
+  modelType: 'default' | 'expert' | 'vision'
   searchEnabled: boolean
   thinkingEnabled: boolean
 }

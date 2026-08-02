@@ -7,12 +7,23 @@
  */
 
 import axios, { AxiosResponse } from 'axios'
+import FormData from 'form-data'
+import mime from 'mime-types'
+import path from 'path'
 import { getDeepSeekHash } from '../../lib/challenge'
 import type { Account, Provider } from '../../store/types'
+import type { ChatMessageContent } from '../types'
 import { resolveDeepSeekChatOptions } from './providerModelOptions'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 
 const DEEPSEEK_API_BASE = 'https://chat.deepseek.com/api'
+const CHAT_COMPLETION_PATH = '/api/v0/chat/completion'
+const FILE_UPLOAD_PATH = '/api/v0/file/upload_file'
+const FILE_FETCH_PATH = '/api/v0/file/fetch_files'
+const FILE_MAX_SIZE = 100 * 1024 * 1024 // 100MB
+const FILE_POLL_ATTEMPTS = 20
+const FILE_POLL_INTERVAL_MS = 1000
+const CHALLENGE_RETRY_ATTEMPTS = 2
 
 const FAKE_HEADERS = {
   Accept: '*/*',
@@ -51,9 +62,25 @@ interface ChallengeResponse {
 
 interface DeepSeekMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
-  content: string | null
+  content: string | ChatMessageContent[] | null
   tool_call_id?: string
   tool_calls?: any[]
+}
+
+interface DeepSeekImageFile {
+  url: string
+  filename: string
+  mimeType: string
+  data: Buffer
+}
+
+interface DeepSeekUploadedFile {
+  id: string
+  status?: string
+  audit_result?: string
+  model_kind?: string
+  is_image?: boolean
+  [key: string]: any
 }
 
 interface ChatCompletionRequest {
@@ -95,11 +122,15 @@ function uuid(): string {
 
 function generateCookie(): string {
   const timestamp = Date.now()
-  return `intercom-HWWAFSESTIME=${timestamp}; HWWAFSESID=${generateRandomString(18, 'hex')}; Hm_lvt_${uuid(false)}=${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)}; Hm_lpvt_${uuid(false)}=${Math.floor(timestamp / 1000)}; _frid=${uuid(false)}; _fr_ssid=${uuid(false)}; _fr_pvid=${uuid(false)}`
+  return `intercom-HWWAFSESTIME=${timestamp}; HWWAFSESID=${generateRandomString(18, 'hex')}; Hm_lvt_${uuid()}=${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)},${Math.floor(timestamp / 1000)}; Hm_lpvt_${uuid()}=${Math.floor(timestamp / 1000)}; _frid=${uuid()}; _fr_ssid=${uuid()}; _fr_pvid=${uuid()}`
 }
 
 function unixTimestamp(): number {
   return Math.floor(Date.now() / 1000)
+}
+
+function deepSeekApiUrl(targetPath: string): string {
+  return `${DEEPSEEK_API_BASE}${targetPath.replace(/^\/api/, '')}`
 }
 
 export class DeepSeekAdapter {
@@ -110,9 +141,8 @@ export class DeepSeekAdapter {
   constructor(provider: Provider, account: Account) {
     this.provider = provider
     this.account = account
-    console.log('[DeepSeek] Account credentials:', JSON.stringify(account.credentials, null, 2))
     this.token = account.credentials.token || account.credentials.apiKey || account.credentials.refreshToken || ''
-    console.log('[DeepSeek] Using token:', this.token.substring(0, 20) + '...')
+    console.log('[DeepSeek] Adapter initialized for account:', account.id)
   }
 
   private async acquireToken(): Promise<string> {
@@ -150,7 +180,7 @@ export class DeepSeekAdapter {
     const bizData = result.data?.data?.biz_data || result.data?.biz_data
     if (!bizData?.token) {
       const errorMsg = result.data?.msg || result.data?.data?.biz_msg || 'Unknown error'
-      console.log('[DeepSeek] Token response data:', JSON.stringify(result.data, null, 2))
+      console.log('[DeepSeek] Token response missing access token')
       throw new Error(`Failed to acquire token: ${errorMsg}`)
     }
 
@@ -187,15 +217,16 @@ export class DeepSeekAdapter {
       }
     )
 
-    console.log('[DeepSeek] Create session response:', JSON.stringify(result.data, null, 2))
+    console.log('[DeepSeek] Create session response status:', result.status)
 
-    // Response structure: { code: 0, data: { biz_code: 0, biz_data: { id: "..." } } }
+    // Older responses wrap the session in `chat_session`; current responses expose it directly.
     const bizData = result.data?.data?.biz_data || result.data?.biz_data
-    if (result.status !== 200 || !bizData?.chat_session?.id) {
+    const sessionId = bizData?.chat_session?.id || bizData?.id
+    if (result.status !== 200 || !sessionId) {
       throw new Error(`Failed to create session: ${result.data?.msg || result.data?.data?.biz_msg || result.status}`)
     }
 
-    const sessionId = bizData?.chat_session?.id
+    console.log('[DeepSeek] Created session')
     sessionCache.set(cacheKey, { sessionId, createdAt: Date.now() })
 
     return sessionId
@@ -224,7 +255,7 @@ export class DeepSeekAdapter {
         // Clear cache
         const cacheKey = this.account.id
         sessionCache.delete(cacheKey)
-        console.log('[DeepSeek] Session deleted:', sessionId)
+        console.log('[DeepSeek] Session deleted')
       }
       return success
     } catch (error) {
@@ -235,45 +266,59 @@ export class DeepSeekAdapter {
 
   private async getChallenge(targetPath: string): Promise<ChallengeResponse> {
     const token = await this.acquireToken()
-    const result = await axios.post(
-      `${DEEPSEEK_API_BASE}/v0/chat/create_pow_challenge`,
-      { target_path: targetPath },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          ...FAKE_HEADERS,
-        },
-        timeout: 15000,
-        validateStatus: () => true,
-      }
-    )
+    let lastError: unknown
 
-    // Response structure: { code: 0, data: { biz_code: 0, biz_data: { challenge: {...} } } }
-    const bizData = result.data?.data?.biz_data || result.data?.biz_data
-    if (result.status !== 200 || !bizData?.challenge) {
-      throw new Error(`Failed to get challenge: ${result.data?.msg || result.data?.data?.biz_msg || result.status}`)
+    for (let attempt = 1; attempt <= CHALLENGE_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const result = await axios.post(
+          `${DEEPSEEK_API_BASE}/v0/chat/create_pow_challenge`,
+          { target_path: targetPath },
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              ...FAKE_HEADERS,
+            },
+            timeout: 30000,
+            validateStatus: () => true,
+          }
+        )
+
+        // Response structure: { code: 0, data: { biz_code: 0, biz_data: { challenge: {...} } } }
+        const bizData = result.data?.data?.biz_data || result.data?.biz_data
+        if (result.status !== 200 || !bizData?.challenge) {
+          throw new Error(`Failed to get challenge: ${result.data?.msg || result.data?.data?.biz_msg || result.status}`)
+        }
+
+        return bizData.challenge
+      } catch (error) {
+        lastError = error
+        if (attempt < CHALLENGE_RETRY_ATTEMPTS) {
+          console.log('[DeepSeek] Retrying challenge request:', { targetPath, attempt })
+          await this.sleep(1000)
+        }
+      }
     }
 
-    return bizData.challenge
+    throw lastError
   }
 
-  private async calculateChallengeAnswer(challenge: ChallengeResponse): Promise<string> {
+  private async calculateChallengeAnswer(challenge: ChallengeResponse, targetPath: string): Promise<string> {
     const { algorithm, challenge: challengeStr, salt, difficulty, expire_at, signature } = challenge
-    
+
     if (algorithm !== 'DeepSeekHashV1') {
       throw new Error(`Unsupported algorithm: ${algorithm}`)
     }
-    
-    console.log('[DeepSeek] Challenge parameters:', { difficulty })
-    
+
+    console.log('[DeepSeek] Challenge parameters:', { difficulty, targetPath })
+
     const deepSeekHash = await getDeepSeekHash()
     const answer = deepSeekHash.calculateHash(algorithm, challengeStr, salt, difficulty, expire_at)
-    
+
     if (answer === undefined) {
       throw new Error('Challenge calculation failed')
     }
-    
-    console.log('[DeepSeek] Challenge answer found:', answer)
+
+    console.log('[DeepSeek] Challenge answer calculated')
 
     return Buffer.from(JSON.stringify({
       algorithm,
@@ -281,8 +326,258 @@ export class DeepSeekAdapter {
       salt,
       answer,
       signature,
-      target_path: '/api/v0/chat/completion',
+      target_path: targetPath,
     })).toString('base64')
+  }
+
+  private isBase64Data(url: string): boolean {
+    return /^data:[^;]+;base64,/i.test(url)
+  }
+
+  private extractBase64Format(url: string): string {
+    const match = url.match(/^data:([^;]+);base64,/i)
+    return match ? match[1] : 'application/octet-stream'
+  }
+
+  private removeBase64Header(url: string): string {
+    return url.replace(/^data:[^;]+;base64,/i, '')
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  private extractImageUrls(messages: DeepSeekMessage[]): string[] {
+    const imageUrls: string[] = []
+
+    for (const message of messages) {
+      if (!Array.isArray(message.content)) continue
+
+      for (const part of message.content) {
+        if (part.type !== 'image_url') continue
+
+        const imageUrl = typeof (part as any).image_url === 'string'
+          ? (part as any).image_url
+          : part.image_url?.url
+
+        if (imageUrl) {
+          imageUrls.push(imageUrl)
+        }
+      }
+    }
+
+    return imageUrls
+  }
+
+  private async loadImageFile(fileUrl: string): Promise<DeepSeekImageFile> {
+    let filename: string
+    let data: Buffer
+    let mimeType: string
+
+    if (fileUrl.startsWith('data:')) {
+      if (!this.isBase64Data(fileUrl)) {
+        throw new Error('DeepSeek vision data URL must be base64 encoded')
+      }
+
+      mimeType = this.extractBase64Format(fileUrl)
+      const ext = mime.extension(mimeType) || 'bin'
+      filename = `${uuid()}.${ext}`
+      data = Buffer.from(this.removeBase64Header(fileUrl), 'base64')
+    } else {
+      let parsedUrl: URL
+      try {
+        parsedUrl = new URL(fileUrl)
+      } catch {
+        throw new Error('DeepSeek vision image_url must be a data URL or absolute HTTP(S) URL')
+      }
+
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('DeepSeek vision remote image_url must use HTTP(S)')
+      }
+
+      filename = path.basename(parsedUrl.pathname) || `${uuid()}.bin`
+      const response = await axios.get(fileUrl, {
+        responseType: 'arraybuffer',
+        maxContentLength: FILE_MAX_SIZE,
+        timeout: 60000,
+        validateStatus: () => true,
+      })
+
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`Failed to download DeepSeek vision image: HTTP ${response.status}`)
+      }
+
+      data = Buffer.from(response.data)
+      const contentType = response.headers['content-type']
+      mimeType = (Array.isArray(contentType) ? contentType[0] : contentType)
+        || mime.lookup(filename)
+        || 'application/octet-stream'
+    }
+
+    if (!mimeType.toLowerCase().startsWith('image/')) {
+      throw new Error(`DeepSeek vision only supports image content, got ${mimeType}`)
+    }
+
+    if (data.length > FILE_MAX_SIZE) {
+      throw new Error(`DeepSeek vision image exceeds ${FILE_MAX_SIZE} bytes`)
+    }
+
+    return { url: fileUrl, filename, mimeType, data }
+  }
+
+  private extractUploadedFile(responseData: any): DeepSeekUploadedFile | null {
+    const bizData = responseData?.data?.biz_data || responseData?.biz_data || responseData?.data || responseData
+    const candidates = [
+      bizData?.file,
+      bizData?.file_info,
+      bizData?.fileInfo,
+      bizData,
+    ]
+
+    for (const files of [bizData?.files, bizData?.file_infos, bizData?.fileInfos]) {
+      if (Array.isArray(files)) {
+        candidates.push(...files)
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (candidate?.id && typeof candidate.id === 'string') {
+        return candidate
+      }
+    }
+
+    return null
+  }
+
+  private extractFetchedFiles(responseData: any): DeepSeekUploadedFile[] {
+    const bizData = responseData?.data?.biz_data || responseData?.biz_data || responseData?.data || responseData
+    if (bizData?.id && typeof bizData.id === 'string') return [bizData]
+
+    const files = bizData?.files || bizData?.file_infos || bizData?.fileInfos || bizData
+
+    if (Array.isArray(files)) return files
+    if (files && typeof files === 'object') {
+      return Object.values(files).filter((file: any) => file?.id && typeof file.id === 'string') as DeepSeekUploadedFile[]
+    }
+    return []
+  }
+
+  private isUploadedFileReady(file: DeepSeekUploadedFile): boolean {
+    const status = String(file.status || '').toUpperCase()
+    const auditResult = String(file.audit_result || file.auditResult || '').toLowerCase()
+    const modelKind = String(file.model_kind || file.modelKind || '').toUpperCase()
+
+    return status === 'SUCCESS'
+      && (!auditResult || auditResult === 'pass')
+      && (!modelKind || modelKind === 'VISION')
+      && file.is_image !== false
+  }
+
+  private async uploadImageFile(imageFile: DeepSeekImageFile, token: string): Promise<string> {
+    console.log('[DeepSeek] Uploading vision image:', {
+      filename: imageFile.filename,
+      mimeType: imageFile.mimeType,
+      size: imageFile.data.length,
+    })
+
+    const challenge = await this.getChallenge(FILE_UPLOAD_PATH)
+    const challengeAnswer = await this.calculateChallengeAnswer(challenge, FILE_UPLOAD_PATH)
+
+    const formData = new FormData()
+    formData.append('file', imageFile.data, {
+      filename: imageFile.filename,
+      contentType: imageFile.mimeType,
+    })
+
+    const response = await axios.post(
+      deepSeekApiUrl(FILE_UPLOAD_PATH),
+      formData,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...FAKE_HEADERS,
+          ...formData.getHeaders(),
+          Cookie: generateCookie(),
+          Referer: 'https://chat.deepseek.com/',
+          'X-Ds-Pow-Response': challengeAnswer,
+          'X-File-Size': String(imageFile.data.length),
+          'X-Model-Type': 'vision',
+        },
+        maxBodyLength: FILE_MAX_SIZE,
+        timeout: 60000,
+        validateStatus: () => true,
+      }
+    )
+
+    const uploadedFile = this.extractUploadedFile(response.data)
+    if (response.status !== 200 || !uploadedFile?.id) {
+      const errorMsg = response.data?.msg || response.data?.data?.biz_msg || `HTTP ${response.status}`
+      throw new Error(`DeepSeek vision upload failed: ${errorMsg}`)
+    }
+
+    console.log('[DeepSeek] Vision image uploaded')
+    await this.waitForUploadedFile(uploadedFile.id, token)
+    return uploadedFile.id
+  }
+
+  private async waitForUploadedFile(fileId: string, token: string): Promise<DeepSeekUploadedFile> {
+    for (let attempt = 1; attempt <= FILE_POLL_ATTEMPTS; attempt++) {
+      const response = await axios.get(
+        deepSeekApiUrl(FILE_FETCH_PATH),
+        {
+          params: { file_ids: fileId },
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...FAKE_HEADERS,
+            Cookie: generateCookie(),
+            Referer: 'https://chat.deepseek.com/',
+          },
+          timeout: 15000,
+          validateStatus: () => true,
+        }
+      )
+
+      if (response.status !== 200) {
+        throw new Error(`Failed to fetch DeepSeek vision file status: HTTP ${response.status}`)
+      }
+
+      const file = this.extractFetchedFiles(response.data).find((item) => item.id === fileId)
+      if (!file) {
+        throw new Error(`DeepSeek vision file not found after upload: ${fileId}`)
+      }
+
+      const status = String(file.status || '').toUpperCase()
+      if (this.isUploadedFileReady(file)) {
+        console.log('[DeepSeek] Vision image ready')
+        return file
+      }
+
+      if (['FAILED', 'FAIL', 'ERROR'].includes(status)) {
+        throw new Error(`DeepSeek vision file processing failed: ${status}`)
+      }
+
+      const auditResult = String(file.audit_result || file.auditResult || '').toLowerCase()
+      if (['failed', 'fail', 'reject', 'rejected', 'block', 'blocked', 'not_pass'].includes(auditResult)) {
+        throw new Error(`DeepSeek vision file audit failed: ${auditResult}`)
+      }
+
+      console.log('[DeepSeek] Waiting for vision image processing:', { status, auditResult, attempt })
+      await this.sleep(FILE_POLL_INTERVAL_MS)
+    }
+
+    throw new Error(`DeepSeek vision file processing timed out: ${fileId}`)
+  }
+
+  private async uploadImages(imageUrls: string[], token: string): Promise<string[]> {
+    const refFileIds: string[] = []
+
+    for (const imageUrl of imageUrls) {
+      const imageFile = await this.loadImageFile(imageUrl)
+      const fileId = await this.uploadImageFile(imageFile, token)
+      refFileIds.push(fileId)
+    }
+
+    return refFileIds
   }
 
   private messagesToPrompt(messages: DeepSeekMessage[], isMultiTurn: boolean = false): string {
@@ -373,20 +668,25 @@ export class DeepSeekAdapter {
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; sessionId: string }> {
     const token = await this.acquireToken()
-    
+
     const sessionId = await this.createSession()
-    console.log('[DeepSeek] Created new session:', sessionId)
-    
-    const challenge = await this.getChallenge('/api/v0/chat/completion')
-    const challengeAnswer = await this.calculateChallengeAnswer(challenge)
+    console.log('[DeepSeek] Using chat session')
 
     // Clone messages to avoid modifying original request
     // Note: Tool prompt injection is already handled by Forwarder.transformRequestForPromptToolUse()
     const messages = [...request.messages]
+    const imageUrls = this.extractImageUrls(messages)
+    const refFileIds = imageUrls.length > 0
+      ? await this.uploadImages(imageUrls, token)
+      : []
 
-    let prompt = this.messagesToPrompt(messages, false)
+    const challenge = await this.getChallenge(CHAT_COMPLETION_PATH)
+    const challengeAnswer = await this.calculateChallengeAnswer(challenge, CHAT_COMPLETION_PATH)
+
+    const prompt = this.messagesToPrompt(messages, false)
 
     const { modelType, searchEnabled, thinkingEnabled } = resolveDeepSeekChatOptions(request, prompt)
+    const finalModelType = refFileIds.length > 0 ? 'vision' : modelType
 
     if (request.web_search || request.model.toLowerCase().includes('search')) {
       console.log('[DeepSeek] Web search enabled')
@@ -397,13 +697,13 @@ export class DeepSeekAdapter {
     }
 
     const response = await axios.post(
-      `${DEEPSEEK_API_BASE}/v0/chat/completion`,
+      deepSeekApiUrl(CHAT_COMPLETION_PATH),
       {
         chat_session_id: sessionId,
         parent_message_id: null,
         prompt,
-        model_type: modelType,
-        ref_file_ids: [],
+        model_type: finalModelType,
+        ref_file_ids: refFileIds,
         search_enabled: searchEnabled,
         thinking_enabled: thinkingEnabled,
         preempt: false,

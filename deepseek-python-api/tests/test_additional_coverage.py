@@ -78,7 +78,9 @@ async def test_default_lifespan_constructs_owned_resources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_request_token_enabled_and_missing_config_error(fake_pow: FakePowSolver) -> None:
+async def test_per_request_token_enabled_and_missing_config_error(
+    tmp_path, fake_pow: FakePowSolver
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("users/current"):
             assert request.headers["authorization"] == "Bearer request-token"
@@ -99,8 +101,11 @@ async def test_per_request_token_enabled_and_missing_config_error(fake_pow: Fake
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
         Settings(
+            api_key=None,
             allow_request_token=True,
+            tokens_file=str(tmp_path / "tokens.json"),
             deepseek_api_base="https://chat.deepseek.test/api",
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
         ),
         http_client=upstream,
         pow_solver=fake_pow,

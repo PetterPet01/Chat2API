@@ -22,10 +22,12 @@ class ByteStream(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
-async def test_health_models_and_validation(fake_pow: FakePowSolver) -> None:
+async def test_health_models_and_validation(tmp_path, fake_pow: FakePowSolver) -> None:
     settings = Settings(
         deepseek_auth_token=SecretStr("token"),
         api_key=SecretStr("client-key"),
+        tokens_file=str(tmp_path / "tokens.json"),
+        proxies_file=str(tmp_path / "missing-proxies.txt"),
     )
     upstream = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(500))
@@ -52,7 +54,7 @@ async def test_health_models_and_validation(fake_pow: FakePowSolver) -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
+async def test_non_streaming_chat_completion(tmp_path, fake_pow: FakePowSolver) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("users/current"):
             return httpx.Response(200, json={"data": {"biz_data": {"token": "access"}}})
@@ -100,8 +102,11 @@ async def test_non_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
         Settings(
+            api_key=None,
             deepseek_auth_token=SecretStr("user-token"),
+            tokens_file=str(tmp_path / "tokens.json"),
             deepseek_api_base="https://chat.deepseek.test/api",
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
         ),
         http_client=upstream,
         pow_solver=fake_pow,
@@ -127,7 +132,7 @@ async def test_non_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
 
 
 @pytest.mark.asyncio
-async def test_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
+async def test_streaming_chat_completion(tmp_path, fake_pow: FakePowSolver) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("users/current"):
             return httpx.Response(200, json={"data": {"biz_data": {"token": "access"}}})
@@ -166,8 +171,11 @@ async def test_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(
         Settings(
+            api_key=None,
             deepseek_auth_token=SecretStr("user-token"),
+            tokens_file=str(tmp_path / "tokens.json"),
             deepseek_api_base="https://chat.deepseek.test/api",
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
         ),
         http_client=upstream,
         pow_solver=fake_pow,
@@ -194,11 +202,19 @@ async def test_streaming_chat_completion(fake_pow: FakePowSolver) -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_token_requires_explicit_enable(fake_pow: FakePowSolver) -> None:
+async def test_request_token_requires_explicit_enable(tmp_path, fake_pow: FakePowSolver) -> None:
     upstream = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(500))
     )
-    app = create_app(Settings(), http_client=upstream, pow_solver=fake_pow)
+    app = create_app(
+        Settings(
+            api_key=None,
+            tokens_file=str(tmp_path / "tokens.json"),
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
+        ),
+        http_client=upstream,
+        pow_solver=fake_pow,
+    )
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"

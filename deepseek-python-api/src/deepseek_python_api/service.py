@@ -57,6 +57,7 @@ class CompletionService:
                 search_enabled=options.search_enabled,
                 thinking_enabled=options.thinking_enabled,
                 image_urls=image_urls,
+                proxy_url=token_lease.proxy_url,
             )
         except asyncio.CancelledError as exc:
             await token_lease.release(success=False, error=exc)

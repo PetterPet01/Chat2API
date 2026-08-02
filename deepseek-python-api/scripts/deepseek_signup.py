@@ -3026,6 +3026,20 @@ Examples:
         else:
             log.warning(f"Proxies file not found: {pf}")
 
+    rotating_proxies = [p for p in proxy_pool if isinstance(p, SyncRotatingProxy)]
+    static_proxies = [p for p in proxy_pool if not isinstance(p, SyncRotatingProxy)]
+
+    if rotating_proxies:
+        if static_proxies:
+            log.warning(f"⚠ Found {len(static_proxies)} static proxies, but ignoring them to prevent IP bans during mass registration.")
+            log.info("Prioritizing rotating proxies exclusively.")
+        proxy_pool = rotating_proxies
+    else:
+        if static_proxies:
+            log.warning("⚠ No rotating proxies found. Using static proxies. BE CAREFUL: DeepSeek may quickly IP-ban static proxies during mass registration!")
+        else:
+            log.warning("⚠ No proxies provided at all. You are using your local IP. This is highly likely to result in an IP ban during mass registration!")
+
     if proxy_pool:
         log.info(f"Loaded {len(proxy_pool)} proxy(s) for requests.")
 

@@ -165,7 +165,10 @@ async def test_full_vision_completion_payload_and_cleanup(
     delete_calls = 0
 
     async def fake_upload_images(
-        self: DeepSeekClient, image_urls: list[str], access_token: str
+        self: DeepSeekClient,
+        image_urls: list[str],
+        access_token: str,
+        proxy_url: str | None = None,
     ) -> list[str]:
         assert image_urls == ["data:image/png;base64," + base64.b64encode(b"png").decode()]
         assert access_token == "access"

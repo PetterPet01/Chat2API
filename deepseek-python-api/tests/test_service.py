@@ -53,6 +53,7 @@ class FakeClient:
         search_enabled: bool,
         thinking_enabled: bool,
         image_urls: list[str],
+        proxy_url: str | None = None,
     ) -> DeepSeekStream:
         self.calls.append(
             {
@@ -62,6 +63,7 @@ class FakeClient:
                 "search_enabled": search_enabled,
                 "thinking_enabled": thinking_enabled,
                 "image_urls": image_urls,
+                "proxy_url": proxy_url,
             }
         )
         if self.error:
