@@ -164,6 +164,7 @@ class TokenManager:
     def load(self) -> None:
         entries = load_proxy_entries(self.settings.proxies_file)
         self._proxy_pool = ProxyPool(entries)
+        self._proxy_pool.load_state(self.settings.proxy_state_file)
         if not self.path.exists():
             self._tokens = []
             return
@@ -522,6 +523,30 @@ class TokenManager:
             "seconds_until_next": round(entry.seconds_until_next_rotation, 1),
             "message": "Rotation succeeded" if ok else "Rotation skipped (too early or failed)",
         }
+
+    async def enable_proxy(self, proxy_id: str) -> dict[str, object]:
+        """Enable the proxy identified by *proxy_id*. Persists state."""
+        async with self._lock:
+            self._proxy_pool.enable_by_id(proxy_id)
+            self._proxy_pool.save_state(self.settings.proxy_state_file)
+        entry = self._proxy_pool.find_by_id(proxy_id)
+        return self._proxy_entry_view(entry)
+
+    async def disable_proxy(self, proxy_id: str) -> dict[str, object]:
+        """Disable the proxy identified by *proxy_id*. Persists state."""
+        async with self._lock:
+            self._proxy_pool.disable_by_id(proxy_id)
+            self._proxy_pool.save_state(self.settings.proxy_state_file)
+        entry = self._proxy_pool.find_by_id(proxy_id)
+        return self._proxy_entry_view(entry)
+
+    def _proxy_entry_view(self, entry: object) -> dict[str, object]:
+        """Return the pool summary entry dict for a single proxy."""
+        return next(
+            (e for e in self._proxy_pool.summary().get("entries", [])  # type: ignore[union-attr]
+             if isinstance(e, dict) and e.get("id") == getattr(entry, "proxy_id", None)),
+            {},
+        )
 
     def _find_token(self, token_id: str) -> ManagedToken | None:
         return next((token for token in self._tokens if token.id == token_id), None)

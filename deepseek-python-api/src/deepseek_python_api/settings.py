@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     tokens_file: str = "deepseek_tokens.json"
     proxies_file: str = "proxies.txt"
+    proxy_state_file: str = "proxies_state.json"
     rotation_strategy: Literal["fill_first", "round_robin"] = "fill_first"
     token_health_check_interval_seconds: int = Field(default=300, ge=0, le=86400)
     token_failure_cooldown_seconds: int = Field(default=300, ge=0, le=86400)

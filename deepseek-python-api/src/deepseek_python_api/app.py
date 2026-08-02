@@ -68,6 +68,12 @@ class UpdateRotationRequest(BaseModel):
     strategy: RotationStrategy
 
 
+class UpdateProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -393,6 +399,20 @@ def create_app(
         return await runtime.token_manager.rotate_proxy_for_token(
             token_id, http_client=runtime.http_client
         )
+
+    @app.patch(
+        "/v0/management/proxies/{proxy_id}",
+        dependencies=[Depends(require_management_api_key)],
+    )
+    async def update_proxy(
+        proxy_id: str,
+        payload: Annotated[UpdateProxyRequest, Body()],
+    ) -> dict[str, object]:
+        """Enable or disable a proxy by its stable proxy_id."""
+        runtime = _runtime(app)
+        if payload.enabled:
+            return await runtime.token_manager.enable_proxy(proxy_id)
+        return await runtime.token_manager.disable_proxy(proxy_id)
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:

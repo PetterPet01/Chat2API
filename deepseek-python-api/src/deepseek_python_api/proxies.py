@@ -17,23 +17,34 @@ Rotating proxy format (line starts with "rotating:"):
 If no prefix is given the line is treated as a static proxy (backward compat).
 
 Selection algorithm:
-  - Both types implement a common ProxyEntry interface (.url property, .kind).
+  - Both types implement a common ProxyEntry interface (.url, .kind, .proxy_id).
   - assign_proxy() and ProxyPool pick entries by index (round-robin) across the
-    combined pool.
+    combined pool, skipping disabled entries.
   - For rotating proxies, rotate() is async and enforces the 60-second minimum
     interval between IP changes.  A failed rotation (too early) is surfaced as a
     warning but the proxy entry remains usable with its current IP.
-  - ProxyPool.rotate_all() rotates every rotating proxy that is past its interval.
+  - ProxyPool.rotate_all() rotates every *enabled* rotating proxy past its interval.
+
+Enable/disable state:
+  - Individual proxies (static or rotating) can be disabled at runtime via the
+    management API or dashboard.
+  - Disabled entries are never picked for new token assignments or rotations.
+  - State is persisted to a JSON sidecar file (proxy_state_file in settings) so
+    it survives restarts.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -47,6 +58,15 @@ _DEFAULT_MIN_ROTATION_INTERVAL = 60.0  # seconds — hard floor imposed by the p
 
 
 # ---------------------------------------------------------------------------
+# Stable proxy ID helper
+# ---------------------------------------------------------------------------
+
+def _make_proxy_id(url: str) -> str:
+    """Return a short stable hex ID derived from the proxy URL."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
 # Static proxy
 # ---------------------------------------------------------------------------
 
@@ -56,6 +76,10 @@ class StaticProxyEntry:
 
     url: str
     kind: Literal["static"] = field(default="static", init=False)
+
+    @property
+    def proxy_id(self) -> str:
+        return _make_proxy_id(self.url)
 
     @property
     def redacted(self) -> str:
@@ -87,6 +111,10 @@ class RotatingProxyEntry:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     kind: Literal["rotating"] = field(default="rotating", init=False)
+
+    @property
+    def proxy_id(self) -> str:
+        return _make_proxy_id(self.url)
 
     @property
     def redacted(self) -> str:
@@ -310,22 +338,33 @@ def assign_proxy(entries: list[ProxyEntry], index: int) -> ProxyEntry | None:
 
 
 # ---------------------------------------------------------------------------
-# ProxyPool — high-level pool with rotation support
+# ProxyPool — high-level pool with enable/disable and rotation support
 # ---------------------------------------------------------------------------
 
 class ProxyPool:
     """Manages a mixed pool of static and rotating proxies.
 
+    Each proxy can be individually enabled or disabled at runtime.  Disabled
+    entries are excluded from ``pick()``, ``rotate_ready()``, and ``rotate_all()``.
+    The enabled/disabled state is persisted to a JSON sidecar file so it
+    survives restarts.
+
     Provides:
-      - ``pick(index)`` — select a proxy by index (same as assign_proxy).
-      - ``rotate_ready()`` — list of rotating entries that can be rotated right now.
-      - ``rotate_all(client)`` — trigger rotation for every ready rotating entry.
-      - ``rotate_for_token(proxy_url, client)`` — rotate the specific rotating
-        proxy bound to a token, if it's a rotating proxy and the interval is up.
+      - ``pick(index)`` — select an *enabled* proxy by index (round-robin).
+      - ``enable_by_id(proxy_id)`` / ``disable_by_id(proxy_id)`` — toggle a proxy.
+      - ``rotate_ready()`` — list of *enabled* rotating entries ready to rotate.
+      - ``rotate_all(client)`` — trigger rotation for every ready enabled rotating entry.
+      - ``rotate_for_proxy_url(url, client)`` — rotate one specific rotating proxy.
+      - ``summary()`` — full status dict including all entries with id/enabled/kind.
     """
 
     def __init__(self, entries: list[ProxyEntry]) -> None:
         self._entries = entries
+        self._disabled: set[str] = set()  # set of disabled proxy URLs
+
+    # ------------------------------------------------------------------
+    # Basic properties
+    # ------------------------------------------------------------------
 
     @property
     def entries(self) -> list[ProxyEntry]:
@@ -336,6 +375,10 @@ class ProxyPool:
         return len(self._entries)
 
     @property
+    def enabled_entries(self) -> list[ProxyEntry]:
+        return [e for e in self._entries if e.url not in self._disabled]
+
+    @property
     def static_count(self) -> int:
         return sum(1 for e in self._entries if isinstance(e, StaticProxyEntry))
 
@@ -343,21 +386,77 @@ class ProxyPool:
     def rotating_count(self) -> int:
         return sum(1 for e in self._entries if isinstance(e, RotatingProxyEntry))
 
-    def pick(self, index: int) -> ProxyEntry | None:
-        return assign_proxy(self._entries, index)
+    # ------------------------------------------------------------------
+    # Lookup
+    # ------------------------------------------------------------------
 
     def find_by_url(self, url: str) -> ProxyEntry | None:
         return next((e for e in self._entries if e.url == url), None)
 
+    def find_by_id(self, proxy_id: str) -> ProxyEntry | None:
+        return next((e for e in self._entries if e.proxy_id == proxy_id), None)
+
+    def is_enabled(self, url: str) -> bool:
+        return url not in self._disabled
+
+    # ------------------------------------------------------------------
+    # Enable / disable
+    # ------------------------------------------------------------------
+
+    def enable_by_id(self, proxy_id: str) -> ProxyEntry:
+        """Enable the proxy with *proxy_id*.  Returns the entry.  Raises if not found."""
+        entry = self.find_by_id(proxy_id)
+        if entry is None:
+            raise DeepSeekProxyError(
+                f"Proxy not found: {proxy_id}",
+                status_code=404,
+                code="proxy_not_found",
+                error_type="invalid_request_error",
+            )
+        self._disabled.discard(entry.url)
+        LOGGER.info("Proxy enabled: %s (%s)", entry.redacted, proxy_id)
+        return entry
+
+    def disable_by_id(self, proxy_id: str) -> ProxyEntry:
+        """Disable the proxy with *proxy_id*.  Returns the entry.  Raises if not found."""
+        entry = self.find_by_id(proxy_id)
+        if entry is None:
+            raise DeepSeekProxyError(
+                f"Proxy not found: {proxy_id}",
+                status_code=404,
+                code="proxy_not_found",
+                error_type="invalid_request_error",
+            )
+        self._disabled.add(entry.url)
+        LOGGER.info("Proxy disabled: %s (%s)", entry.redacted, proxy_id)
+        return entry
+
+    # ------------------------------------------------------------------
+    # Picking
+    # ------------------------------------------------------------------
+
+    def pick(self, index: int) -> ProxyEntry | None:
+        """Return the entry at *index* mod len(enabled_entries), or None."""
+        enabled = self.enabled_entries
+        if not enabled:
+            return None
+        return enabled[index % len(enabled)]
+
+    # ------------------------------------------------------------------
+    # Rotation
+    # ------------------------------------------------------------------
+
     def rotate_ready(self) -> list[RotatingProxyEntry]:
-        """Return rotating entries whose cooldown has expired."""
+        """Return *enabled* rotating entries whose cooldown has expired."""
         return [
             e for e in self._entries
-            if isinstance(e, RotatingProxyEntry) and e.ready_to_rotate
+            if isinstance(e, RotatingProxyEntry)
+            and self.is_enabled(e.url)
+            and e.ready_to_rotate
         ]
 
     async def rotate_all(self, client: httpx.AsyncClient | None = None) -> dict[str, bool]:
-        """Rotate every rotating proxy that is ready.  Returns {redacted_url: success}."""
+        """Rotate every *enabled* rotating proxy that is ready.  Returns {redacted_url: success}."""
         ready = self.rotate_ready()
         if not ready:
             return {}
@@ -378,19 +477,71 @@ class ProxyPool:
             return False
         return await entry.rotate(client=client)
 
+    # ------------------------------------------------------------------
+    # Persistence (enabled/disabled state)
+    # ------------------------------------------------------------------
+
+    def load_state(self, path: str | Path) -> None:
+        """Load enabled/disabled state from *path* (JSON sidecar).  Silent if missing."""
+        file_path = Path(path).expanduser()
+        if not file_path.exists():
+            return
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            disabled = data.get("disabled", [])
+            if isinstance(disabled, list):
+                self._disabled = {url for url in disabled if isinstance(url, str)}
+        except Exception as exc:
+            LOGGER.warning("Failed to load proxy state from %s: %s", file_path, exc)
+
+    def save_state(self, path: str | Path) -> None:
+        """Persist enabled/disabled state to *path* atomically."""
+        file_path = Path(path).expanduser()
+        payload: dict[str, Any] = {"disabled": sorted(self._disabled)}
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{file_path.name}.", dir=file_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, file_path)
+        except Exception as exc:
+            LOGGER.warning("Failed to save proxy state to %s: %s", file_path, exc)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
     def summary(self) -> dict[str, object]:
+        all_entries = []
+        for e in self._entries:
+            entry_dict: dict[str, object] = {
+                "id": e.proxy_id,
+                "kind": e.kind,
+                "proxy": e.redacted,
+                "enabled": self.is_enabled(e.url),
+            }
+            if isinstance(e, RotatingProxyEntry):
+                entry_dict["min_interval_seconds"] = e.min_interval
+                entry_dict["seconds_until_next_rotation"] = round(
+                    e.seconds_until_next_rotation, 1
+                )
+                entry_dict["ready_to_rotate"] = e.ready_to_rotate
+            all_entries.append(entry_dict)
+
+        enabled_count = len(self.enabled_entries)
         return {
             "total": self.count,
+            "enabled": enabled_count,
+            "disabled": self.count - enabled_count,
             "static": self.static_count,
             "rotating": self.rotating_count,
+            "entries": all_entries,
+            # Keep legacy key for backward compat with older dashboard/tests
             "rotating_entries": [
-                {
-                    "proxy": e.redacted,
-                    "min_interval_seconds": e.min_interval,
-                    "seconds_until_next_rotation": round(e.seconds_until_next_rotation, 1),
-                    "ready_to_rotate": e.ready_to_rotate,
-                }
-                for e in self._entries
-                if isinstance(e, RotatingProxyEntry)
+                e for e in all_entries if e["kind"] == "rotating"
             ],
         }

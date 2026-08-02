@@ -362,13 +362,113 @@ class TestProxyPool:
         assert result is True
 
     def test_summary_contains_expected_keys(self) -> None:
-        pool, *_ = self._pool()
+        pool, s1, s2, r1 = self._pool()
         s = pool.summary()
         assert s["total"] == 3
         assert s["static"] == 2
         assert s["rotating"] == 1
+        assert s["enabled"] == 3
+        assert s["disabled"] == 0
+        assert isinstance(s["entries"], list)
+        assert len(s["entries"]) == 3
         assert isinstance(s["rotating_entries"], list)
         assert len(s["rotating_entries"]) == 1
+        # All entries should have id, kind, proxy, enabled
+        for e in s["entries"]:
+            assert "id" in e
+            assert "kind" in e
+            assert "proxy" in e
+            assert "enabled" in e
+
+    # --- proxy_id / find_by_id ---
+
+    def test_proxy_id_stable(self) -> None:
+        s = StaticProxyEntry("http://1.1.1.1:8080")
+        assert len(s.proxy_id) == 12
+        assert s.proxy_id == s.proxy_id  # deterministic
+
+    def test_find_by_id(self) -> None:
+        pool, s1, s2, r1 = self._pool()
+        assert pool.find_by_id(s1.proxy_id) is s1
+        assert pool.find_by_id(r1.proxy_id) is r1
+        assert pool.find_by_id("nonexistent") is None
+
+    # --- enable / disable ---
+
+    def test_disable_excludes_from_pick(self) -> None:
+        pool, s1, s2, r1 = self._pool()
+        pool.disable_by_id(s1.proxy_id)  # disable s1
+        # Now only s2 and r1 are enabled; pick should never return s1
+        picked = [pool.pick(i) for i in range(10)]
+        assert s1 not in picked
+        assert s2 in picked
+        assert r1 in picked
+
+    def test_enable_restores_to_pick(self) -> None:
+        pool, s1, s2, r1 = self._pool()
+        pool.disable_by_id(s1.proxy_id)
+        pool.enable_by_id(s1.proxy_id)
+        picked = [pool.pick(i) for i in range(6)]
+        assert s1 in picked
+
+    def test_disable_all_returns_none_from_pick(self) -> None:
+        pool, s1, s2, r1 = self._pool()
+        for e in (s1, s2, r1):
+            pool.disable_by_id(e.proxy_id)
+        assert pool.pick(0) is None
+
+    def test_disabled_excluded_from_rotate_ready(self) -> None:
+        pool, _, _, r1 = self._pool()
+        pool.disable_by_id(r1.proxy_id)
+        assert pool.rotate_ready() == []
+
+    def test_summary_reflects_enabled_disabled_counts(self) -> None:
+        pool, s1, s2, r1 = self._pool()
+        pool.disable_by_id(s2.proxy_id)
+        s = pool.summary()
+        assert s["enabled"] == 2
+        assert s["disabled"] == 1
+        disabled_entries = [e for e in s["entries"] if not e["enabled"]]
+        assert len(disabled_entries) == 1
+        assert disabled_entries[0]["id"] == s2.proxy_id
+
+    def test_disable_raises_on_unknown_id(self) -> None:
+        pool, *_ = self._pool()
+        from deepseek_python_api.errors import DeepSeekProxyError
+        with pytest.raises(DeepSeekProxyError):
+            pool.disable_by_id("badid")
+
+    # --- state persistence ---
+
+    def test_save_and_load_state(self, tmp_path: Path) -> None:
+        pool, s1, s2, r1 = self._pool()
+        pool.disable_by_id(s1.proxy_id)
+        state_file = tmp_path / "proxies_state.json"
+        pool.save_state(state_file)
+
+        # Load into a fresh pool with same entries
+        pool2 = ProxyPool([s1, s2, r1])
+        pool2.load_state(state_file)
+        assert not pool2.is_enabled(s1.url)
+        assert pool2.is_enabled(s2.url)
+
+    def test_load_state_missing_file_is_noop(self, tmp_path: Path) -> None:
+        pool, *_ = self._pool()
+        pool.load_state(tmp_path / "nonexistent.json")  # must not raise
+        assert pool.count == 3
+
+    def test_save_state_atomic_write(self, tmp_path: Path) -> None:
+        """save_state should produce valid JSON and no tmp file leftovers."""
+        pool, s1, *_ = self._pool()
+        pool.disable_by_id(s1.proxy_id)
+        state_file = tmp_path / "st.json"
+        pool.save_state(state_file)
+        assert state_file.exists()
+        import json as _json
+        data = _json.loads(state_file.read_text())
+        assert s1.url in data["disabled"]
+        # No temp files should remain
+        assert len(list(tmp_path.iterdir())) == 1
 
 
 # ---------------------------------------------------------------------------
