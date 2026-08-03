@@ -46,11 +46,12 @@ FAKE_HEADERS = {
 }
 
 
-@dataclass(slots=True)
+@dataclass
 class TokenCacheEntry:
     access_token: str
     expires_at: float
     proxy_url: str | None = None
+    cookie: str = field(default_factory=lambda: _generate_cookie())
 
 
 class DeepSeekStream:
@@ -116,7 +117,7 @@ class DeepSeekClient:
 
     async def acquire_token(
         self, user_token: str, *, force_refresh: bool = False, proxy_url: str | None = None
-    ) -> str:
+    ) -> TokenCacheEntry:
         cached = self._tokens.get(user_token)
         if (
             not force_refresh
@@ -124,7 +125,7 @@ class DeepSeekClient:
             and cached.expires_at > time.monotonic()
             and cached.proxy_url == proxy_url
         ):
-            return cached.access_token
+            return cached
 
         lock = self._token_locks.setdefault(user_token, asyncio.Lock())
         async with lock:
@@ -135,7 +136,7 @@ class DeepSeekClient:
                 and cached.expires_at > time.monotonic()
                 and cached.proxy_url == proxy_url
             ):
-                return cached.access_token
+                return cached
 
             response = await self._client_for_proxy(proxy_url).get(
                 self._api_url("/api/v0/users/current"),
@@ -156,22 +157,23 @@ class DeepSeekClient:
                 raise UpstreamProtocolError(
                     "DeepSeek access-token response did not contain a token"
                 )
-            self._tokens[user_token] = TokenCacheEntry(
+            entry = TokenCacheEntry(
                 access_token=access_token,
                 expires_at=time.monotonic() + self.settings.access_token_ttl_seconds,
                 proxy_url=proxy_url,
             )
-            return access_token
+            self._tokens[user_token] = entry
+            return entry
 
     def forget_token(self, user_token: str) -> None:
         self._tokens.pop(user_token, None)
         self._token_locks.pop(user_token, None)
 
-    async def create_session(self, access_token: str, proxy_url: str | None = None) -> str:
+    async def create_session(self, access_token: str, cookie: str, proxy_url: str | None = None) -> str:
         response = await self._client_for_proxy(proxy_url).post(
             self._api_url("/api/v0/chat_session/create"),
             json={},
-            headers=self._headers(access_token, cookie=True),
+            headers=self._headers(access_token, cookie=cookie),
             timeout=self.settings.connect_timeout_seconds,
         )
         biz_data = _biz_data(response)
@@ -194,24 +196,24 @@ class DeepSeekClient:
         self, session_id: str, user_token: str | None = None, proxy_url: str | None = None
     ) -> bool:
         try:
-            token = (
+            token_entry = (
                 await self.acquire_token(user_token, proxy_url=proxy_url)
                 if user_token
                 else next(
                     (
-                        item.access_token
+                        item
                         for item in self._tokens.values()
                         if item.expires_at > time.monotonic()
                     ),
                     None,
                 )
             )
-            if not token:
+            if not token_entry:
                 return False
             response = await self._client_for_proxy(proxy_url).post(
                 self._api_url("/api/v0/chat_session/delete"),
                 json={"chat_session_id": session_id},
-                headers=self._headers(token),
+                headers=self._headers(token_entry.access_token, cookie=token_entry.cookie),
                 timeout=self.settings.connect_timeout_seconds,
             )
             return response.status_code == 200 and response.json().get("code") == 0
@@ -220,7 +222,7 @@ class DeepSeekClient:
             return False
 
     async def get_challenge(
-        self, access_token: str, target_path: str, proxy_url: str | None = None
+        self, access_token: str, cookie: str, target_path: str, proxy_url: str | None = None
     ) -> Challenge:
         last_error: Exception | None = None
         for attempt in range(self.settings.challenge_retry_attempts):
@@ -228,7 +230,7 @@ class DeepSeekClient:
                 response = await self._client_for_proxy(proxy_url).post(
                     self._api_url("/api/v0/chat/create_pow_challenge"),
                     json={"target_path": target_path},
-                    headers=self._headers(access_token),
+                    headers=self._headers(access_token, cookie=cookie),
                     timeout=self.settings.challenge_timeout_seconds,
                 )
                 biz_data = _biz_data(response)
@@ -253,7 +255,7 @@ class DeepSeekClient:
         ) from last_error
 
     async def upload_images(
-        self, image_urls: list[str], access_token: str, proxy_url: str | None = None
+        self, image_urls: list[str], access_token: str, cookie: str, proxy_url: str | None = None
     ) -> list[str]:
         if len(image_urls) > self.settings.max_images:
             raise DeepSeekProxyError(
@@ -265,20 +267,20 @@ class DeepSeekClient:
         file_ids: list[str] = []
         for image_url in image_urls:
             image = await self._image_loader.load(image_url)
-            file_ids.append(await self.upload_image(image, access_token, proxy_url))
+            file_ids.append(await self.upload_image(image, access_token, cookie, proxy_url))
         return file_ids
 
     async def upload_image(
-        self, image: ImageFile, access_token: str, proxy_url: str | None = None
+        self, image: ImageFile, access_token: str, cookie: str, proxy_url: str | None = None
     ) -> str:
-        challenge = await self.get_challenge(access_token, FILE_UPLOAD_PATH, proxy_url)
+        challenge = await self.get_challenge(access_token, cookie, FILE_UPLOAD_PATH, proxy_url)
         answer = await self._pow.create_answer(challenge, FILE_UPLOAD_PATH)
         response = await self._client_for_proxy(proxy_url).post(
             self._api_url(FILE_UPLOAD_PATH),
             files={"file": (image.filename, image.data, image.mime_type)},
             headers=self._headers(
                 access_token,
-                cookie=True,
+                cookie=cookie,
                 extra={
                     "X-Ds-Pow-Response": answer,
                     "X-File-Size": str(len(image.data)),
@@ -297,17 +299,17 @@ class DeepSeekClient:
         file_id = uploaded.get("id")
         if not isinstance(file_id, str):
             raise UpstreamProtocolError("DeepSeek vision upload response did not contain a file ID")
-        await self.wait_for_uploaded_file(file_id, access_token, proxy_url)
+        await self.wait_for_uploaded_file(file_id, access_token, cookie, proxy_url)
         return file_id
 
     async def wait_for_uploaded_file(
-        self, file_id: str, access_token: str, proxy_url: str | None = None
+        self, file_id: str, access_token: str, cookie: str, proxy_url: str | None = None
     ) -> dict[str, Any]:
         for attempt in range(self.settings.file_poll_attempts):
             response = await self._client_for_proxy(proxy_url).get(
                 self._api_url(FILE_FETCH_PATH),
                 params={"file_ids": file_id},
-                headers=self._headers(access_token, cookie=True),
+                headers=self._headers(access_token, cookie=cookie),
                 timeout=self.settings.connect_timeout_seconds,
             )
             if response.status_code != 200:
@@ -347,13 +349,15 @@ class DeepSeekClient:
         image_urls: list[str],
         proxy_url: str | None = None,
     ) -> DeepSeekStream:
-        access_token = await self.acquire_token(user_token, proxy_url=proxy_url)
-        session_id = await self.create_session(access_token, proxy_url)
+        token_entry = await self.acquire_token(user_token, proxy_url=proxy_url)
+        access_token = token_entry.access_token
+        cookie = token_entry.cookie
+        session_id = await self.create_session(access_token, cookie, proxy_url)
         try:
             file_ids = (
-                await self.upload_images(image_urls, access_token, proxy_url) if image_urls else []
+                await self.upload_images(image_urls, access_token, cookie, proxy_url) if image_urls else []
             )
-            challenge = await self.get_challenge(access_token, CHAT_COMPLETION_PATH, proxy_url)
+            challenge = await self.get_challenge(access_token, cookie, CHAT_COMPLETION_PATH, proxy_url)
             answer = await self._pow.create_answer(challenge, CHAT_COMPLETION_PATH)
             request_context = self._client_for_proxy(proxy_url).stream(
                 "POST",
@@ -370,7 +374,7 @@ class DeepSeekClient:
                 },
                 headers=self._headers(
                     access_token,
-                    cookie=True,
+                    cookie=cookie,
                     referer=f"https://chat.deepseek.com/a/chat/s/{session_id}",
                     extra={"X-Ds-Pow-Response": answer},
                 ),
@@ -407,13 +411,13 @@ class DeepSeekClient:
     def _headers(
         token: str,
         *,
-        cookie: bool = False,
+        cookie: str | None = None,
         referer: str | None = None,
         extra: dict[str, str] | None = None,
     ) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {token}", **FAKE_HEADERS}
         if cookie:
-            headers["Cookie"] = _generate_cookie()
+            headers["Cookie"] = cookie
         if referer:
             headers["Referer"] = referer
         if extra:
