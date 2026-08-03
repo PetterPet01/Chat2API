@@ -12,7 +12,7 @@ license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Chat2API Team" }]
 dependencies = [
   "fastapi>=0.116,<1",
-  "httpx>=0.28,<1",
+  "httpx[http2]>=0.28,<1",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
   "uvicorn[standard]>=0.35,<1",

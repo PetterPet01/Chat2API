@@ -28,7 +28,7 @@ FAKE_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
     "Origin": "https://chat.deepseek.com",
     "Referer": "https://chat.deepseek.com/",
-    "Sec-Ch-Ua": '"Not/A)Brand";v="99", "Chromium";v="148"',
+    "Sec-Ch-Ua": '"Not/A)Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Dest": "empty",
@@ -36,7 +36,7 @@ FAKE_HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
     ),
     "X-App-Version": "2.0.0",
     "X-Client-Locale": "zh_CN",
@@ -106,7 +106,8 @@ class DeepSeekClient:
             return self._http
         client = self._proxy_clients.get(proxy_url)
         if client is None:
-            client = httpx.AsyncClient(proxy=proxy_url)
+            timeout = httpx.Timeout(120.0, connect=30.0, read=120.0)
+            client = httpx.AsyncClient(proxy=proxy_url, timeout=timeout, http2=True)
             self._proxy_clients[proxy_url] = client
         return client
 
