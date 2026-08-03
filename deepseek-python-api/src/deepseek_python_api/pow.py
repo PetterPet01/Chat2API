@@ -53,7 +53,6 @@ class DeepSeekHashSolver:
         with as_file(asset) as wasm_path:
             self._module = Module.from_file(self._engine, str(wasm_path))
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="deepseek-pow")
-        self._lock = Lock()
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=True)
@@ -87,50 +86,49 @@ class DeepSeekHashSolver:
     def _calculate_hash(self, challenge: Challenge) -> int | float:
         # wasmtime Stores are not thread-safe. A fresh Store/Instance per solve keeps the
         # compiled module cached while isolating mutable linear memory.
-        with self._lock:
-            store = Store(self._engine)
-            instance = Instance(store, self._module, [])
-            exports = instance.exports(store)
-            memory = exports["memory"]
-            allocate = exports["__wbindgen_export_0"]
-            reallocate = exports["__wbindgen_export_1"]
-            stack_pointer = exports["__wbindgen_add_to_stack_pointer"]
-            solve = exports["wasm_solve"]
-            if (
-                not isinstance(memory, Memory)
-                or not isinstance(allocate, Func)
-                or not isinstance(reallocate, Func)
-                or not isinstance(stack_pointer, Func)
-                or not isinstance(solve, Func)
-            ):
-                raise UpstreamProtocolError("DeepSeek proof-of-work WASM exports are invalid")
+        store = Store(self._engine)
+        instance = Instance(store, self._module, [])
+        exports = instance.exports(store)
+        memory = exports["memory"]
+        allocate = exports["__wbindgen_export_0"]
+        reallocate = exports["__wbindgen_export_1"]
+        stack_pointer = exports["__wbindgen_add_to_stack_pointer"]
+        solve = exports["wasm_solve"]
+        if (
+            not isinstance(memory, Memory)
+            or not isinstance(allocate, Func)
+            or not isinstance(reallocate, Func)
+            or not isinstance(stack_pointer, Func)
+            or not isinstance(solve, Func)
+        ):
+            raise UpstreamProtocolError("DeepSeek proof-of-work WASM exports are invalid")
 
-            prefix = f"{challenge.salt}_{challenge.expire_at}_"
-            retptr = int(stack_pointer(store, -16))
-            try:
-                challenge_ptr, challenge_len = self._write_string(
-                    store, memory, allocate, reallocate, challenge.challenge
-                )
-                prefix_ptr, prefix_len = self._write_string(
-                    store, memory, allocate, reallocate, prefix
-                )
-                solve(
-                    store,
-                    retptr,
-                    challenge_ptr,
-                    challenge_len,
-                    prefix_ptr,
-                    prefix_len,
-                    float(challenge.difficulty),
-                )
-                raw = bytes(memory.read(store, retptr, retptr + 16))
-                status = struct.unpack_from("<i", raw, 0)[0]
-                value = struct.unpack_from("<d", raw, 8)[0]
-                if status == 0:
-                    raise UpstreamProtocolError("DeepSeek proof-of-work calculation failed")
-                return int(value) if value.is_integer() else value
-            finally:
-                stack_pointer(store, 16)
+        prefix = f"{challenge.salt}_{challenge.expire_at}_"
+        retptr = int(stack_pointer(store, -16))
+        try:
+            challenge_ptr, challenge_len = self._write_string(
+                store, memory, allocate, reallocate, challenge.challenge
+            )
+            prefix_ptr, prefix_len = self._write_string(
+                store, memory, allocate, reallocate, prefix
+            )
+            solve(
+                store,
+                retptr,
+                challenge_ptr,
+                challenge_len,
+                prefix_ptr,
+                prefix_len,
+                float(challenge.difficulty),
+            )
+            raw = bytes(memory.read(store, retptr, retptr + 16))
+            status = struct.unpack_from("<i", raw, 0)[0]
+            value = struct.unpack_from("<d", raw, 8)[0]
+            if status == 0:
+                raise UpstreamProtocolError("DeepSeek proof-of-work calculation failed")
+            return int(value) if value.is_integer() else value
+        finally:
+            stack_pointer(store, 16)
 
     @staticmethod
     def _write_string(
