@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import stat
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -303,6 +304,197 @@ async def test_token_health_states_and_cooldown(tmp_path: Path) -> None:
     assert summary["counts"]["unhealthy"] == 1
     assert summary["counts"]["cooldown"] == 1
     assert summary["counts"]["healthy"] == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_account_saves_only_redacted_public_view(tmp_path: Path) -> None:
+    store = tmp_path / "tokens.json"
+    client = FakeDeepSeekClient()
+    manager = token_manager(make_settings(store), client)
+    manager.load()
+
+    view = await manager.submit_account(
+        email="person@example.com",
+        password="account-password",
+        token="submitted-token",
+        name="submitted account",
+    )
+
+    assert view["status"] == "healthy"
+    assert view["enabled"] is True
+    assert view["account_email"] == "person@example.com"
+    assert view["name"] == "submitted account"
+    assert client.checked == ["submitted-token"]
+    assert "account-password" not in str(view)
+    assert "submitted-token" not in str(view)
+    assert "account_password" not in view
+    assert "token" not in view
+
+    payload = json.loads(store.read_text(encoding="utf-8"))
+    stored = payload["tokens"][0]
+    assert stored["account_email"] == "person@example.com"
+    assert stored["account_password"] == "account-password"
+    assert stored["token"] == "submitted-token"
+    assert stored["enabled"] is True
+    assert stored["status"] == "healthy"
+
+    reloaded = token_manager(make_settings(store), client)
+    reloaded.load()
+    listed = (await reloaded.list_tokens())[0]
+    assert listed["account_email"] == "person@example.com"
+    assert "account-password" not in str(listed)
+    assert "submitted-token" not in str(listed)
+
+
+@pytest.mark.asyncio
+async def test_submit_account_deletes_failed_health_check(tmp_path: Path) -> None:
+    store = tmp_path / "tokens.json"
+    client = FakeDeepSeekClient()
+    client.failures["bad-submission-token"] = AuthenticationError()
+    manager = token_manager(make_settings(store), client)
+    manager.load()
+
+    with pytest.raises(DeepSeekProxyError, match="failed the auth health check"):
+        await manager.submit_account(
+            email="bad@example.com",
+            password="bad-password",
+            token="bad-submission-token",
+        )
+    with pytest.raises(DeepSeekProxyError, match="Email may not be empty"):
+        await manager.submit_account(email="   ", password="password", token="token")
+    with pytest.raises(DeepSeekProxyError, match="Password may not be empty"):
+        await manager.submit_account(email="person@example.com", password="   ", token="token")
+    with pytest.raises(DeepSeekProxyError, match="DeepSeek token may not be empty"):
+        await manager.submit_account(email="person@example.com", password="password", token="   ")
+
+    assert (await manager.summary())["token_count"] == 0
+    assert client.checked == ["bad-submission-token"]
+    assert client.forgotten == ["bad-submission-token"]
+    text = store.read_text(encoding="utf-8")
+    assert "bad@example.com" not in text
+    assert "bad-password" not in text
+    assert "bad-submission-token" not in text
+
+
+@pytest.mark.asyncio
+async def test_submission_api_key_page_success_failure_and_duplicate(
+    tmp_path: Path, fake_pow: FakePowSolver
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("users/current"):
+            auth = request.headers["authorization"]
+            if auth == "Bearer submitted-token":
+                return httpx.Response(200, json={"data": {"biz_data": {"token": "access"}}})
+            if auth == "Bearer rejected-token":
+                return httpx.Response(401)
+        raise AssertionError(request.url)
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        Settings(
+            management_api_key=SecretStr("management-key"),
+            account_submission_key=SecretStr("submission-key"),
+            tokens_file=str(tmp_path / "tokens.json"),
+            proxies_file=str(tmp_path / "missing-proxies.txt"),
+            token_health_check_interval_seconds=0,
+        ),
+        http_client=upstream,
+        pow_solver=fake_pow,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as api:
+            page = await api.get("/submit-account")
+            assert page.status_code == 200
+            assert "Submit DeepSeek Account" in page.text
+            assert "/v0/accounts/submit" in page.text
+            assert "keyInput.value = '';" in page.text
+            assert "DeepSeek Python API Dashboard" not in page.text
+            assert "submitted-token" not in page.text
+
+            payload = {
+                "email": "person@example.com",
+                "password": "account-password",
+                "token": "submitted-token",
+                "name": "submitted account",
+            }
+            unauthorized = await api.post("/v0/accounts/submit", json=payload)
+            assert unauthorized.status_code == 401
+            wrong_key = await api.post(
+                "/v0/accounts/submit",
+                headers={"X-Submission-Key": "wrong"},
+                json=payload,
+            )
+            assert wrong_key.status_code == 401
+            missing_config_app = create_app(
+                Settings(
+                    tokens_file=str(tmp_path / "missing-config-tokens.json"),
+                    proxies_file=str(tmp_path / "missing-proxies.txt"),
+                    token_health_check_interval_seconds=0,
+                ),
+                http_client=upstream,
+                pow_solver=fake_pow,
+            )
+            async with missing_config_app.router.lifespan_context(missing_config_app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=missing_config_app), base_url="http://test"
+                ) as missing_config_client:
+                    missing_config = await missing_config_client.post(
+                        "/v0/accounts/submit",
+                        headers={"Authorization": "Bearer anything"},
+                        json=payload,
+                    )
+            assert missing_config.status_code == 503
+            assert missing_config.json()["error"]["code"] == "configuration_error"
+
+            submitted = await api.post(
+                "/v0/accounts/submit",
+                headers={"Authorization": "Bearer submission-key"},
+                json=payload,
+            )
+            assert submitted.status_code == 200
+            body = submitted.json()["account"]
+            assert body["status"] == "healthy"
+            assert body["enabled"] is True
+            assert body["account_email"] == "person@example.com"
+            assert "account-password" not in submitted.text
+            assert "submitted-token" not in submitted.text
+            assert "account_password" not in submitted.text
+
+            duplicate = await api.post(
+                "/v0/accounts/submit",
+                headers={"Authorization": "Bearer submission-key"},
+                json=payload,
+            )
+            assert duplicate.status_code == 409
+            assert "submitted-token" not in duplicate.text
+
+            rejected = await api.post(
+                "/v0/accounts/submit",
+                headers={"X-Submission-Key": "submission-key"},
+                json={
+                    "email": "bad@example.com",
+                    "password": "bad-password",
+                    "token": "rejected-token",
+                },
+            )
+            assert rejected.status_code == 400
+            assert rejected.json()["error"]["code"] == "submission_health_check_failed"
+            assert "bad-password" not in rejected.text
+            assert "rejected-token" not in rejected.text
+
+            listed = await api.get(
+                "/v0/management/tokens",
+                headers={"Authorization": "Bearer management-key"},
+            )
+            assert [item["account_email"] for item in listed.json()["data"]] == [
+                "person@example.com"
+            ]
+            assert "bad@example.com" not in listed.text
+            assert "bad-password" not in listed.text
+            assert "rejected-token" not in listed.text
+    await upstream.aclose()
 
 
 @pytest.mark.asyncio

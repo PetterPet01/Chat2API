@@ -15,7 +15,7 @@ from uuid import uuid4
 import httpx
 
 from .errors import AuthenticationError, ConfigurationError, DeepSeekProxyError
-from .proxies import ProxyEntry, ProxyPool, RotatingProxyEntry, assign_proxy, load_proxy_entries
+from .proxies import ProxyPool, RotatingProxyEntry, load_proxy_entries
 from .settings import Settings
 from .upstream import DeepSeekClient
 
@@ -45,6 +45,9 @@ class ManagedToken:
     cooldown_until: float | None = None
     in_flight: int = 0
     proxy_url: str | None = None
+    account_email: str | None = None
+    account_password: str | None = None
+    submitted_at: float | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -78,6 +81,13 @@ class ManagedToken:
             proxy_url=payload.get("proxy_url")
             if isinstance(payload.get("proxy_url"), str)
             else None,
+            account_email=payload.get("account_email")
+            if isinstance(payload.get("account_email"), str)
+            else None,
+            account_password=payload.get("account_password")
+            if isinstance(payload.get("account_password"), str)
+            else None,
+            submitted_at=_optional_float(payload.get("submitted_at")),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -98,6 +108,9 @@ class ManagedToken:
             "last_used_at": self.last_used_at,
             "cooldown_until": self.cooldown_until,
             "proxy_url": self.proxy_url,
+            "account_email": self.account_email,
+            "account_password": self.account_password,
+            "submitted_at": self.submitted_at,
         }
 
     def public_view(self, now: float | None = None) -> dict[str, Any]:
@@ -126,6 +139,8 @@ class ManagedToken:
             "cooldown_until": self.cooldown_until,
             "in_flight": self.in_flight,
             "proxy": redact_proxy(self.proxy_url),
+            "account_email": self.account_email,
+            "submitted_at": self.submitted_at,
         }
 
 
@@ -245,6 +260,9 @@ class TokenManager:
         name: str | None = None,
         enabled: bool = True,
         proxy_url: str | None = None,
+        account_email: str | None = None,
+        account_password: str | None = None,
+        submitted_at: float | None = None,
     ) -> dict[str, Any]:
         if not token:
             raise DeepSeekProxyError(
@@ -254,31 +272,119 @@ class TokenManager:
                 error_type="invalid_request_error",
             )
         async with self._lock:
-            fingerprint = token_fingerprint(token)
-            if any(item.fingerprint == fingerprint for item in self._tokens):
-                raise DeepSeekProxyError(
-                    "DeepSeek token already exists",
-                    status_code=409,
-                    code="duplicate_token",
-                    error_type="invalid_request_error",
-                )
-            now = time.time()
-            proxy = self._proxy_pool.pick(len(self._tokens))
-            assigned_proxy_url = (
-                proxy_url if proxy_url is not None else proxy.url if proxy else None
-            )
-            record = ManagedToken(
-                id=f"tok_{uuid4().hex}",
-                name=name or f"DeepSeek token {len(self._tokens) + 1}",
-                token=token,
+            record = self._add_token_unlocked(
+                token,
+                name=name,
                 enabled=enabled,
-                created_at=now,
-                updated_at=now,
-                proxy_url=assigned_proxy_url,
+                proxy_url=proxy_url,
+                account_email=account_email,
+                account_password=account_password,
+                submitted_at=submitted_at,
             )
-            self._tokens.append(record)
             self._save_unlocked()
-            return record.public_view(now)
+            return record.public_view()
+
+    async def submit_account(
+        self,
+        *,
+        email: str,
+        password: str,
+        token: str,
+        name: str | None = None,
+        proxy_url: str | None = None,
+    ) -> dict[str, Any]:
+        email = email.strip()
+        token = token.strip()
+        if not email:
+            raise DeepSeekProxyError(
+                "Email may not be empty",
+                status_code=400,
+                code="invalid_email",
+                error_type="invalid_request_error",
+            )
+        if not password.strip():
+            raise DeepSeekProxyError(
+                "Password may not be empty",
+                status_code=400,
+                code="invalid_password",
+                error_type="invalid_request_error",
+            )
+        if not token:
+            raise DeepSeekProxyError(
+                "DeepSeek token may not be empty",
+                status_code=400,
+                code="invalid_token",
+                error_type="invalid_request_error",
+            )
+
+        async with self._lock:
+            record = self._add_token_unlocked(
+                token,
+                name=name or email,
+                enabled=False,
+                proxy_url=proxy_url,
+                account_email=email,
+                account_password=password,
+                submitted_at=time.time(),
+            )
+            token_id = record.id
+            self._save_unlocked()
+
+        await self.check_token(token_id)
+        async with self._lock:
+            record = self._require_token(token_id)
+            if record.status == "healthy":
+                record.enabled = True
+                record.updated_at = time.time()
+                self._save_unlocked()
+                return record.public_view()
+
+        await self.delete_token(token_id)
+        raise DeepSeekProxyError(
+            "Submitted DeepSeek token failed the auth health check",
+            status_code=400,
+            code="submission_health_check_failed",
+            error_type="invalid_request_error",
+        )
+
+    def _add_token_unlocked(
+        self,
+        token: str,
+        *,
+        name: str | None = None,
+        enabled: bool = True,
+        proxy_url: str | None = None,
+        account_email: str | None = None,
+        account_password: str | None = None,
+        submitted_at: float | None = None,
+    ) -> ManagedToken:
+        fingerprint = token_fingerprint(token)
+        if any(item.fingerprint == fingerprint for item in self._tokens):
+            raise DeepSeekProxyError(
+                "DeepSeek token already exists",
+                status_code=409,
+                code="duplicate_token",
+                error_type="invalid_request_error",
+            )
+        now = time.time()
+        proxy = self._proxy_pool.pick(len(self._tokens))
+        assigned_proxy_url = proxy_url if proxy_url is not None else proxy.url if proxy else None
+        status: TokenStatus = "unchecked" if enabled else "disabled"
+        record = ManagedToken(
+            id=f"tok_{uuid4().hex}",
+            name=name or f"DeepSeek token {len(self._tokens) + 1}",
+            token=token,
+            enabled=enabled,
+            status=status,
+            created_at=now,
+            updated_at=now,
+            proxy_url=assigned_proxy_url,
+            account_email=account_email,
+            account_password=account_password,
+            submitted_at=submitted_at,
+        )
+        self._tokens.append(record)
+        return record
 
     async def update_token(
         self,
@@ -469,11 +575,19 @@ class TokenManager:
     ) -> None:
         now = time.time()
         token.updated_at = now
-        token.failure_count += 1
-        token.consecutive_failures += 1
         token.last_error = _safe_error(error)
         if checked:
             token.last_checked_at = now
+
+        if isinstance(error, DeepSeekProxyError) and error.status_code in {429, 502, 503, 504}:
+            # Do not increment failures or put on cooldown for rate limits/overloads or server errors
+            return
+        if isinstance(error, httpx.TransportError | httpx.TimeoutException):
+            # Do not penalize tokens for network drops
+            return
+
+        token.failure_count += 1
+        token.consecutive_failures += 1
         if isinstance(error, AuthenticationError):
             token.status = "unhealthy"
             token.cooldown_until = None
@@ -542,9 +656,16 @@ class TokenManager:
 
     def _proxy_entry_view(self, entry: object) -> dict[str, object]:
         """Return the pool summary entry dict for a single proxy."""
+        entries = self._proxy_pool.summary().get("entries", [])
+        if not isinstance(entries, list):
+            return {}
+        proxy_id = getattr(entry, "proxy_id", None)
         return next(
-            (e for e in self._proxy_pool.summary().get("entries", [])  # type: ignore[union-attr]
-             if isinstance(e, dict) and e.get("id") == getattr(entry, "proxy_id", None)),
+            (
+                cast(dict[str, object], candidate)
+                for candidate in entries
+                if isinstance(candidate, dict) and candidate.get("id") == proxy_id
+            ),
             {},
         )
 
@@ -590,6 +711,7 @@ def redact_token(token: str) -> str:
 
 def redact_proxy(proxy_url: str | None) -> str | None:
     from .proxies import StaticProxyEntry as _SE
+
     return _SE(proxy_url).redacted if proxy_url else None
 
 

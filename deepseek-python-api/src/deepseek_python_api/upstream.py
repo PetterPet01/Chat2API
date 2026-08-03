@@ -145,8 +145,10 @@ class DeepSeekClient:
             if response.status_code in {401, 403}:
                 raise AuthenticationError()
             if response.status_code != 200:
+                status_code = 429 if response.status_code in {202, 429} else 502
                 raise UpstreamProtocolError(
-                    f"Failed to acquire DeepSeek access token: HTTP {response.status_code}"
+                    f"Failed to acquire DeepSeek access token: HTTP {response.status_code}",
+                    status_code=status_code,
                 )
             biz_data = _biz_data(response)
             access_token = biz_data.get("token") if isinstance(biz_data, dict) else None
@@ -180,8 +182,11 @@ class DeepSeekClient:
                 session_id = chat_session.get("id")
             session_id = session_id or biz_data.get("id")
         if response.status_code != 200 or not isinstance(session_id, str):
+            body = response.text[:2048] if response.status_code != 200 else ""
+            status_code = 429 if response.status_code in {202, 429} else 502
             raise UpstreamProtocolError(
-                f"Failed to create DeepSeek chat session: HTTP {response.status_code}"
+                f"Failed to create DeepSeek chat session: HTTP {response.status_code} {body}".strip(),
+                status_code=status_code,
             )
         return session_id
 
@@ -229,9 +234,12 @@ class DeepSeekClient:
                 biz_data = _biz_data(response)
                 challenge = biz_data.get("challenge") if isinstance(biz_data, dict) else None
                 if response.status_code != 200 or not isinstance(challenge, dict):
+                    body = response.text[:2048] if response.status_code != 200 else ""
+                    status_code = 429 if response.status_code in {202, 429} else 502
                     raise UpstreamProtocolError(
-                        "Failed to get DeepSeek proof-of-work challenge: "
-                        f"HTTP {response.status_code}"
+                        f"Failed to get DeepSeek proof-of-work challenge: "
+                        f"HTTP {response.status_code} {body}".strip(),
+                        status_code=status_code,
                     )
                 return Challenge.from_payload(challenge)
             except (httpx.TransportError, httpx.TimeoutException, UpstreamProtocolError) as exc:
@@ -281,8 +289,10 @@ class DeepSeekClient:
         )
         uploaded = _extract_uploaded_file(response)
         if response.status_code != 200 or not uploaded:
+            status_code = 429 if response.status_code in {202, 429} else 502
             raise UpstreamProtocolError(
-                f"DeepSeek vision upload failed: HTTP {response.status_code}"
+                f"DeepSeek vision upload failed: HTTP {response.status_code}",
+                status_code=status_code,
             )
         file_id = uploaded.get("id")
         if not isinstance(file_id, str):
@@ -301,13 +311,18 @@ class DeepSeekClient:
                 timeout=self.settings.connect_timeout_seconds,
             )
             if response.status_code != 200:
+                status_code = 429 if response.status_code in {202, 429} else 502
                 raise UpstreamProtocolError(
-                    f"Failed to fetch DeepSeek vision file status: HTTP {response.status_code}"
+                    f"Failed to fetch DeepSeek vision file status: HTTP {response.status_code}",
+                    status_code=status_code,
                 )
             file = next(
                 (item for item in _extract_fetched_files(response) if item["id"] == file_id), None
             )
             if not file:
+                if attempt + 1 < self.settings.file_poll_attempts:
+                    await asyncio.sleep(self.settings.file_poll_interval_seconds)
+                    continue
                 raise UpstreamProtocolError("DeepSeek vision file was not found after upload")
             if _is_file_ready(file):
                 return file
@@ -365,12 +380,15 @@ class DeepSeekClient:
             if response.status_code in {401, 403}:
                 await request_context.__aexit__(None, None, None)
                 raise AuthenticationError()
-            if response.status_code >= 400:
+            if response.status_code != 200:
                 body = (await response.aread())[:2048].decode(errors="replace")
                 await request_context.__aexit__(None, None, None)
+                status_code = 429 if response.status_code in {202, 429} else (
+                    502 if response.status_code >= 500 else response.status_code
+                )
                 raise UpstreamProtocolError(
                     f"DeepSeek completion failed: HTTP {response.status_code} {body}".strip(),
-                    status_code=502 if response.status_code >= 500 else response.status_code,
+                    status_code=status_code,
                 )
             return DeepSeekStream(
                 request_context, response, self, session_id, user_token, proxy_url
