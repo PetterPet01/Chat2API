@@ -6,7 +6,7 @@ import logging
 import secrets
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -429,13 +429,16 @@ class DeepSeekClient:
 def _generate_cookie() -> str:
     timestamp_ms = int(time.time() * 1000)
     timestamp = timestamp_ms // 1000
+    # Baidu Tongji site IDs are 32-char hex strings (md5) - not uuid format
+    site_id = uuid4().hex
     return (
         f"intercom-HWWAFSESTIME={timestamp_ms}; "
         f"HWWAFSESID={secrets.token_hex(9)}; "
-        f"Hm_lvt_{uuid4()}={timestamp},{timestamp},{timestamp}; "
-        f"Hm_lpvt_{uuid4()}={timestamp}; _frid={uuid4()}; "
-        f"_fr_ssid={uuid4()}; _fr_pvid={uuid4()}"
+        f"Hm_lvt_{site_id}={timestamp},{timestamp},{timestamp}; "
+        f"Hm_lpvt_{site_id}={timestamp}; _frid={uuid4().hex}; "
+        f"_fr_ssid={uuid4().hex}; _fr_pvid={uuid4().hex}"
     )
+
 
 
 def _json(response: httpx.Response) -> Any:
