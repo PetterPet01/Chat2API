@@ -44,6 +44,19 @@ to invoke tool calls.
 _TAG_NAME_PATTERN = re.compile(r"<\s*(/?)\s*([^\s>/]+)([^>]*)>", re.DOTALL)
 _ATTR_PATTERN = re.compile(r"([a-zA-Z_][\w:-]*)\s*=\s*(['\"])(.*?)\2", re.DOTALL)
 _DSML_LOOKALIKE_PATTERN = re.compile(r"<\s*/?[^\s>]*DSML[^\s>]*")
+_DSH_TOOL_DETAILS_PATTERN = re.compile(
+    r"<details\b[^>]*>\s*"
+    r"<summary\b[^>]*>\s*[^<]*Tool Calls\s*</summary>"
+    r"(?P<body>.*?)</details>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSH_TOOL_DETAILS_START_PATTERN = re.compile(
+    r"<details\b[^>]*>\s*<summary\b[^>]*>\s*[^<]*Tool Calls",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSH_THOUGHT_PATTERN = re.compile(r"<thought>.*?</thought>", re.DOTALL | re.IGNORECASE)
+_DSH_FORMAL_NOTICE_PATTERN = re.compile(r"(?m)^\s*<formal notice\)>.*(?:\n|$)")
+_DSH_CONTEXT_INJECTION_PATTERN = re.compile(r"(?m)^\s*Context injection[^\n]*(?:\n|$)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +143,16 @@ def parse_completion_text(
     blocks = _find_elements(text, "tool_calls", allow_plain=False)
     recovered = any(_uses_compat_tag(block.tag) for block in blocks)
     if not blocks:
+        dsh_tool_details = _parse_dsh_tool_details(text, requested)
+        if dsh_tool_details is not None:
+            content = _clean_dsh_harness_content(_remove_spans(text, dsh_tool_details.spans)).strip()
+            return ParsedDSMLCompletion(
+                content=content,
+                tool_calls=dsh_tool_details.calls,
+                recovered=True,
+            )
+        if _looks_like_dsh_tool_details(text):
+            raise DSMLParseError("Malformed DeepSeek DSML tool call block")
         if _looks_like_dsml(text):
             if _has_tag_named(text, "tool_calls"):
                 raise DSMLParseError("Malformed DeepSeek DSML tool call block")
@@ -175,6 +198,8 @@ def parsed_tool_calls_to_openai(calls: list[ParsedDSMLToolCall]) -> list[dict[st
 def _parse_tool_block(
     body: str,
     requested: dict[str, dict[str, Any]],
+    *,
+    allow_untyped_parameters: bool = False,
 ) -> list[ParsedDSMLToolCall]:
     calls: list[ParsedDSMLToolCall] = []
     consumed: list[tuple[int, int]] = []
@@ -184,7 +209,14 @@ def _parse_tool_block(
         name = attrs.get("name")
         if not name:
             raise DSMLParseError("DeepSeek DSML invoke is missing a name")
-        calls.append(_parse_invoke(name, invoke.body, requested))
+        calls.append(
+            _parse_invoke(
+                name,
+                invoke.body,
+                requested,
+                allow_untyped_parameters=allow_untyped_parameters,
+            )
+        )
     remainder = _remove_spans(body, consumed).strip()
     if remainder:
         raise DSMLParseError("Unexpected text inside DeepSeek DSML tool_calls block")
@@ -195,6 +227,8 @@ def _parse_invoke(
     name: str,
     body: str,
     requested: dict[str, dict[str, Any]],
+    *,
+    allow_untyped_parameters: bool = False,
 ) -> ParsedDSMLToolCall:
     if requested and name not in requested:
         raise DSMLParseError(f"Unknown DeepSeek DSML tool name: {name}")
@@ -208,7 +242,9 @@ def _parse_invoke(
             raise DSMLParseError("DeepSeek DSML parameter is missing a name")
         is_string = attrs.get("string")
         if is_string not in {"true", "false"}:
-            raise DSMLParseError("DeepSeek DSML parameter is missing string=\"true|false\"")
+            if not allow_untyped_parameters:
+                raise DSMLParseError("DeepSeek DSML parameter is missing string=\"true|false\"")
+            is_string = "true"
         args[param_name] = _decode_parameter(param.body, is_string == "true")
     remainder = _remove_spans(body, consumed).strip()
     if remainder:
@@ -348,6 +384,10 @@ def _looks_like_dsml(text: str) -> bool:
     )
 
 
+def _looks_like_dsh_tool_details(text: str) -> bool:
+    return _DSH_TOOL_DETAILS_START_PATTERN.search(text) is not None
+
+
 @dataclass(frozen=True, slots=True)
 class _RecoveredInvokes:
     calls: list[ParsedDSMLToolCall]
@@ -370,6 +410,35 @@ def _parse_recoverable_without_wrapper(
     if not calls:
         return None
     return _RecoveredInvokes(calls=calls, spans=spans)
+
+
+def _parse_dsh_tool_details(
+    text: str,
+    requested: dict[str, dict[str, Any]],
+) -> _RecoveredInvokes | None:
+    matches = list(_DSH_TOOL_DETAILS_PATTERN.finditer(text))
+    if not matches:
+        return None
+    calls: list[ParsedDSMLToolCall] = []
+    spans: list[tuple[int, int]] = []
+    for match in matches:
+        parsed = _parse_tool_block(
+            match.group("body"),
+            requested,
+            allow_untyped_parameters=True,
+        )
+        calls.extend(parsed)
+        spans.append(match.span())
+    if not calls:
+        raise DSMLParseError("DeepSeek Harness tool-call details block did not contain any invokes")
+    return _RecoveredInvokes(calls=calls, spans=spans)
+
+
+def _clean_dsh_harness_content(text: str) -> str:
+    cleaned = _DSH_THOUGHT_PATTERN.sub("", text)
+    cleaned = _DSH_FORMAL_NOTICE_PATTERN.sub("", cleaned)
+    cleaned = _DSH_CONTEXT_INJECTION_PATTERN.sub("", cleaned)
+    return cleaned
 
 
 def _find_elements(text: str, semantic: str, *, allow_plain: bool) -> list[_Element]:

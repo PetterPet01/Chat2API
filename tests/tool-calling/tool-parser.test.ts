@@ -21,6 +21,21 @@ const tools = [
   },
 ]
 
+const bashTools = [
+  {
+    name: 'bash',
+    description: 'Run a shell command',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        description: { type: 'string' },
+      },
+    },
+    source: 'openai' as const,
+  },
+]
+
 test('managed bracket parses valid tool call', () => {
   const result = managedBracketProtocol.parse(
     '[function_calls]\n[call:default_api:read_file]{"filePath":"/tmp/a"}[/call]\n[/function_calls]',
@@ -193,6 +208,99 @@ test('deepseek dsml records unknown tool names without executing them', () => {
   assert.equal(result.toolCalls.length, 0)
   assert.deepEqual(result.invalidToolNames, ['missing_tool'])
   assert.match(result.malformedReason || '', /contained no valid invokes/)
+})
+
+test('deepseek dsml parses DSH tool-call details markup', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<formal notice)>Let me read the planning files.\n<thought>This should not leak downstream.</thought>\nContext injectionplanning-with-files\nI will resume this work.\n<details> <summary>🔧 Tool Calls</summary> <invoke name="default_api:read_file"> <parameter name="filePath">/tmp/task_plan.md</parameter> </invoke> <invoke name="default_api:read_file"> <parameter name="filePath">/tmp/findings.md</parameter> </invoke> </details>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 2)
+  assert.deepEqual(
+    result.toolCalls.map((call) => JSON.parse(call.function.arguments)),
+    [{ filePath: '/tmp/task_plan.md' }, { filePath: '/tmp/findings.md' }],
+  )
+  assert.equal(result.content, 'I will resume this work.')
+})
+
+test('deepseek dsml parses DSH bash details markup', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<details> <summary>🔧 Tool Calls</summary>'
+      + ' <invoke name="bash">'
+      + ' <parameter name="command">'
+      + 'cd /home/pet/Projects/zcode-api && cat task_plan.md 2>/dev/null; '
+      + 'echo "---FINDINGS---"; cat findings.md 2>/dev/null; '
+      + 'echo "---PROGRESS---"; cat progress.md 2>/dev/null'
+      + '</parameter>'
+      + ' <parameter name="description">Read planning files</parameter>'
+      + ' </invoke>'
+      + ' <invoke name="bash">'
+      + ' <parameter name="command">'
+      + 'cd /home/pet/Projects/zcode-api && git diff --stat 2>/dev/null; '
+      + 'echo "---STATUS---"; git status --short 2>/dev/null; '
+      + 'echo "---WC---"; wc -l src/proxy/captcha.ts'
+      + '</parameter>'
+      + ' <parameter name="description">Check git state and captcha file size</parameter>'
+      + ' </invoke>'
+      + ' <invoke name="bash">'
+      + ' <parameter name="command">'
+      + 'cd /home/pet/Projects/zcode-api && pwd && ls -la zcode-proxy 2>/dev/null; '
+      + 'echo "---CONFIG---"; cat config.sandbox.yaml 2>/dev/null'
+      + '</parameter>'
+      + ' <parameter name="description">Check working dir, binary, config</parameter>'
+      + ' </invoke>'
+      + ' </details>',
+    { tools: bashTools, protocol: 'deepseek_dsml' },
+  )
+
+  const args = result.toolCalls.map((call) => JSON.parse(call.function.arguments))
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 3)
+  assert.deepEqual(args.map((arg) => arg.description), [
+    'Read planning files',
+    'Check git state and captcha file size',
+    'Check working dir, binary, config',
+  ])
+  assert.match(args[0].command, /^cd \/home\/pet\/Projects\/zcode-api && cat task_plan\.md/)
+  assert.match(args[1].command, /wc -l src\/proxy\/captcha\.ts/)
+  assert.match(args[2].command, /cat config\.sandbox\.yaml/)
+  assert.equal(result.content, '')
+})
+
+test('deepseek dsml rejects malformed DSH tool-call details markup', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<details><summary>🔧 Tool Calls</summary><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</invoke></details>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 0)
+  assert.match(result.malformedReason || '', /Malformed DeepSeek DSML/)
+})
+
+test('deepseek dsml rejects truncated DSH tool-call details markup', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<details><summary>🔧 Tool Calls</summary>'
+      + '<invoke name="default_api:read_file">'
+      + '<parameter name="filePath">/tmp/a</parameter></invoke>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 0)
+  assert.match(result.malformedReason || '', /Malformed DeepSeek DSML/)
+})
+
+test('deepseek dsml detects DSH details tool-call starts', () => {
+  const detection = deepseekDsmlProtocol.detectStart(
+    'prefix<details> <summary>🔧 Tool Calls</summary>',
+  )
+
+  assert.equal(detection.matched, true)
+  assert.equal(detection.markerStart, 6)
 })
 
 test('deepseek dsml does not execute arbitrary unmarked XML', () => {

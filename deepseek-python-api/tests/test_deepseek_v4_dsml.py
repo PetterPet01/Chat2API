@@ -242,6 +242,116 @@ def test_parse_completion_text_rejects_dsml_tag_with_extra_letters() -> None:
         )
 
 
+def test_parse_completion_text_accepts_dsh_tool_details_markup() -> None:
+    parsed = parse_completion_text(
+        "<formal notice)>Let me read the planning files.\n"
+        "<thought>This should not leak downstream.</thought>\n"
+        "Context injectionplanning-with-files\n"
+        "I'll resume this work.\n"
+        "<details> <summary>🔧 Tool Calls</summary>"
+        ' <invoke name="lookup">'
+        ' <parameter name="query">task_plan.md</parameter>'
+        " </invoke>"
+        ' <invoke name="lookup">'
+        ' <parameter name="query">findings.md</parameter>'
+        " </invoke>"
+        " </details>",
+        tools=TOOLS,
+    )
+
+    assert parsed.recovered is True
+    assert parsed.content == "I'll resume this work."
+    assert [call.arguments for call in parsed.tool_calls] == [
+        {"query": "task_plan.md"},
+        {"query": "findings.md"},
+    ]
+
+
+def test_parse_completion_text_accepts_dsh_bash_details_markup() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    parsed = parse_completion_text(
+        "<details> <summary>🔧 Tool Calls</summary>"
+        ' <invoke name="bash">'
+        ' <parameter name="command">'
+        "cd /home/pet/Projects/zcode-api && cat task_plan.md 2>/dev/null; "
+        'echo "---FINDINGS---"; cat findings.md 2>/dev/null; '
+        'echo "---PROGRESS---"; cat progress.md 2>/dev/null'
+        "</parameter>"
+        ' <parameter name="description">Read planning files</parameter>'
+        " </invoke>"
+        ' <invoke name="bash">'
+        ' <parameter name="command">'
+        "cd /home/pet/Projects/zcode-api && git diff --stat 2>/dev/null; "
+        'echo "---STATUS---"; git status --short 2>/dev/null; '
+        'echo "---WC---"; wc -l src/proxy/captcha.ts'
+        "</parameter>"
+        ' <parameter name="description">Check git state and captcha file size</parameter>'
+        " </invoke>"
+        ' <invoke name="bash">'
+        ' <parameter name="command">'
+        "cd /home/pet/Projects/zcode-api && pwd && "
+        "ls -la zcode-proxy 2>/dev/null; "
+        'echo "---CONFIG---"; cat config.sandbox.yaml 2>/dev/null'
+        "</parameter>"
+        ' <parameter name="description">Check working dir, binary, config</parameter>'
+        " </invoke>"
+        " </details>",
+        tools=tools,
+    )
+
+    assert parsed.recovered is True
+    assert parsed.content == ""
+    assert [call.name for call in parsed.tool_calls] == ["bash", "bash", "bash"]
+    assert [call.arguments["description"] for call in parsed.tool_calls] == [
+        "Read planning files",
+        "Check git state and captcha file size",
+        "Check working dir, binary, config",
+    ]
+    assert parsed.tool_calls[0].arguments["command"].startswith(
+        "cd /home/pet/Projects/zcode-api && cat task_plan.md"
+    )
+    assert "wc -l src/proxy/captcha.ts" in parsed.tool_calls[1].arguments["command"]
+    assert "cat config.sandbox.yaml" in parsed.tool_calls[2].arguments["command"]
+
+
+def test_parse_completion_text_rejects_malformed_dsh_tool_details_markup() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<details><summary>🔧 Tool Calls</summary>"
+            '<invoke name="lookup">'
+            '<parameter name="query">missing close</invoke>'
+            "</details>",
+            tools=TOOLS,
+        )
+
+
+def test_parse_completion_text_rejects_truncated_dsh_tool_details_markup() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<details><summary>🔧 Tool Calls</summary>"
+            '<invoke name="lookup">'
+            '<parameter name="query">missing close</parameter>'
+            "</invoke>",
+            tools=TOOLS,
+        )
+
+
 def test_parse_completion_text_schema_aware_arguments_wrapper_recovery() -> None:
     parsed = parse_completion_text(
         "<｜DSML｜tool_calls>"

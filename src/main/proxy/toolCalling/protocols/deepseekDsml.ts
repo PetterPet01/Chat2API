@@ -17,6 +17,11 @@ const INVOKE_END = `</${DSML}invoke>`
 const PARAM_END = `</${DSML}parameter>`
 const TAG_NAME_PATTERN = /<\s*(\/?)\s*([^\s>/]+)([^>]*)>/g
 const DSML_LOOKALIKE_PATTERN = /<\s*\/?[^\s>]*DSML[^\s>]*/
+const DSH_TOOL_DETAILS_PATTERN = /<details\b[^>]*>\s*<summary\b[^>]*>\s*[^<]*Tool Calls\s*<\/summary>([\s\S]*?)<\/details>/gi
+const DSH_TOOL_DETAILS_START_PATTERN = /<details\b[^>]*>\s*<summary\b[^>]*>\s*[^<]*Tool Calls/i
+const DSH_THOUGHT_PATTERN = /<thought>[\s\S]*?<\/thought>/gi
+const DSH_FORMAL_NOTICE_PATTERN = /^\s*<formal notice\)>.*(?:\n|$)/gm
+const DSH_CONTEXT_INJECTION_PATTERN = /^\s*Context injection[^\n]*(?:\n|$)/gm
 
 export const deepseekDsmlProtocol: ToolProtocolAdapter = {
   id: 'deepseek_dsml',
@@ -50,13 +55,27 @@ to invoke tool calls.`
   },
 
   detectStart(buffer) {
-    return detectMarkers(buffer, [
+    const dsml = detectMarkers(buffer, [
       TOOL_START,
       `<${DSML}invoke`,
       '<DSML',
       '<｜｜DSML｜｜tool_calls>',
       '<｜｜DSML｜｜invoke',
     ])
+    if (dsml.matched || dsml.partial) return dsml
+
+    const detailsIndex = buffer.search(/<details\b/i)
+    if (detailsIndex !== -1) {
+      const candidate = buffer.slice(detailsIndex)
+      if (DSH_TOOL_DETAILS_START_PATTERN.test(candidate)) {
+        return { matched: true, partial: false, markerStart: detailsIndex }
+      }
+      if (/^<details\b[^>]*>\s*(?:<summary\b[^>]*>\s*[^<]*)?$/i.test(candidate)) {
+        return { matched: false, partial: true, markerStart: detailsIndex }
+      }
+    }
+
+    return { matched: false, partial: false }
   },
 
   parse(content: string, context: ToolParseContext) {
@@ -69,6 +88,23 @@ to invoke tool calls.`
     if (blocks === 'malformed') return malformedDsmlResult(content, rawMatches, invalidToolNames)
 
     if (blocks.length === 0) {
+      const dshDetails = parseDshToolDetails(content, context, rawMatches, invalidToolNames, allowedNames)
+      if (dshDetails === 'malformed') return malformedDsmlResult(content, rawMatches, invalidToolNames)
+      if (dshDetails.length > 0) {
+        const cleanContent = cleanDshHarnessContent(
+          content.replace(DSH_TOOL_DETAILS_PATTERN, ''),
+        ).trim()
+        return createParseResult({
+          content: cleanContent,
+          toolCalls: dshDetails,
+          protocol: 'deepseek_dsml',
+          rawMatches,
+          invalidToolNames,
+        })
+      }
+      if (looksLikeDshToolDetails(content)) {
+        return malformedDsmlResult(content, rawMatches, invalidToolNames)
+      }
       if (looksLikeDsml(content)) {
         if (hasTagNamed(content, 'tool_calls')) {
           return malformedDsmlResult(content, rawMatches, invalidToolNames)
@@ -161,13 +197,38 @@ function malformedDsmlResult(
   })
 }
 
+function parseDshToolDetails(
+  content: string,
+  context: ToolParseContext,
+  rawMatches: string[],
+  invalidToolNames: string[],
+  allowedNames: Set<string>,
+): ReturnType<typeof buildToolCall>[] | 'malformed' {
+  const calls: ReturnType<typeof buildToolCall>[] = []
+  DSH_TOOL_DETAILS_PATTERN.lastIndex = 0
+  for (const match of content.matchAll(DSH_TOOL_DETAILS_PATTERN)) {
+    const parsed = parseInvokes(
+      match[1],
+      context,
+      rawMatches,
+      invalidToolNames,
+      allowedNames,
+      { allowPlain: true, allowUntypedParameters: true },
+    )
+    if (parsed === 'malformed') return 'malformed'
+    calls.push(...parsed)
+    rawMatches.push(match[0])
+  }
+  return calls
+}
+
 function parseInvokes(
   content: string,
   context: ToolParseContext,
   rawMatches: string[],
   invalidToolNames: string[],
   allowedNames: Set<string>,
-  options: { allowPlain: boolean },
+  options: { allowPlain: boolean, allowUntypedParameters?: boolean },
 ): ReturnType<typeof buildToolCall>[] | 'malformed' {
   const invokes = findElements(content, 'invoke', options)
   if (invokes === 'malformed' || invokes.length === 0) return 'malformed'
@@ -182,7 +243,12 @@ function parseInvokes(
       invalidToolNames.push(name)
       continue
     }
-    const args = parseParameters(name, invoke.body, context.tools)
+    const args = parseParameters(
+      name,
+      invoke.body,
+      context.tools,
+      options.allowUntypedParameters ?? false,
+    )
     if (args === null) return 'malformed'
     toolCalls.push(
       buildToolCall(
@@ -202,6 +268,7 @@ function parseParameters(
   name: string,
   content: string,
   tools: NormalizedToolDefinition[],
+  allowUntypedParameters: boolean,
 ): Record<string, unknown> | null {
   const params = findElements(content, 'parameter', { allowPlain: true })
   if (params === 'malformed') return null
@@ -210,8 +277,12 @@ function parseParameters(
   for (const param of params) {
     const attrs = parseAttrs(param.attrs)
     const parameterName = attrs.name
-    const stringFlag = attrs.string
-    if (!parameterName || (stringFlag !== 'true' && stringFlag !== 'false')) return null
+    let stringFlag = attrs.string
+    if (!parameterName) return null
+    if (stringFlag !== 'true' && stringFlag !== 'false') {
+      if (!allowUntypedParameters) return null
+      stringFlag = 'true'
+    }
     args[parameterName] = decodeParameter(param.body, stringFlag === 'true')
   }
   const remainder = removeSpans(content, params.map((param) => param.raw)).trim()
@@ -339,6 +410,18 @@ function hasTagNamed(content: string, semantic: string): boolean {
 
 function removeSpans(content: string, rawSpans: string[]): string {
   return rawSpans.reduce((acc, raw) => acc.replace(raw, ''), content)
+}
+
+function cleanDshHarnessContent(content: string): string {
+  return content
+    .replace(DSH_THOUGHT_PATTERN, '')
+    .replace(DSH_FORMAL_NOTICE_PATTERN, '')
+    .replace(DSH_CONTEXT_INJECTION_PATTERN, '')
+}
+
+function looksLikeDshToolDetails(content: string): boolean {
+  DSH_TOOL_DETAILS_START_PATTERN.lastIndex = 0
+  return DSH_TOOL_DETAILS_START_PATTERN.test(content)
 }
 
 function looksLikeDsml(content: string): boolean {
