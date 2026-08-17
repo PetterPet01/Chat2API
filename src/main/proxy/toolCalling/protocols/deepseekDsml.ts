@@ -15,6 +15,8 @@ const TOOL_START = `<${DSML}tool_calls>`
 const TOOL_END = `</${DSML}tool_calls>`
 const INVOKE_END = `</${DSML}invoke>`
 const PARAM_END = `</${DSML}parameter>`
+const DSH_TOOL_START = '<DSML｜tool_calls>'
+const DSH_TOOL_END = '</DSML｜tool_calls>'
 
 export const deepseekDsmlProtocol: ToolProtocolAdapter = {
   id: 'deepseek_dsml',
@@ -48,7 +50,13 @@ to invoke tool calls.`
   },
 
   detectStart(buffer) {
-    return detectMarkers(buffer, [TOOL_START, `<${DSML}invoke`, '<｜｜DSML｜｜tool_calls>', '<｜｜DSML｜｜invoke'])
+    return detectMarkers(buffer, [
+      TOOL_START,
+      `<${DSML}invoke`,
+      DSH_TOOL_START,
+      '<｜｜DSML｜｜tool_calls>',
+      '<｜｜DSML｜｜invoke',
+    ])
   },
 
   parse(content: string, context: ToolParseContext) {
@@ -56,23 +64,30 @@ to invoke tool calls.`
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const toolCalls = []
-    const blocks = [...content.matchAll(new RegExp(`<${DSML}tool_calls>([\\s\\S]*?)</${DSML}tool_calls>`, 'g'))]
+    let blocks = [...content.matchAll(new RegExp(`<${DSML}tool_calls>([\\s\\S]*?)</${DSML}tool_calls>`, 'g'))]
+    let dialect: DsmlDialect = 'canonical'
 
     if (blocks.length === 0) {
-      if (looksLikeDsml(content)) {
-        const recovered = parseInvokes(content.replaceAll('｜｜DSML｜｜', DSML), context, rawMatches, invalidToolNames, allowedNames)
+      blocks = [...content.matchAll(/<DSML｜tool_calls>([\s\S]*?)<\/DSML｜tool_calls>/g)]
+      if (blocks.length > 0) {
+        dialect = 'dsh_wrapper'
+      } else if (looksLikeDsml(content)) {
+        const recovered = parseInvokes(
+          content.replaceAll('｜｜DSML｜｜', DSML),
+          context,
+          rawMatches,
+          invalidToolNames,
+          allowedNames,
+          'canonical',
+        )
         if (recovered === 'malformed') {
-          return createParseResult({
-            content,
-            toolCalls: [],
-            protocol: 'deepseek_dsml',
-            rawMatches,
-            invalidToolNames,
-            malformedReason: 'Malformed DeepSeek DSML tool call block',
-          })
+          return malformedDsmlResult(content, rawMatches, invalidToolNames)
         }
-        if (toolCalls.length === 0 && recovered.length > 0) {
-          const cleanContent = recovered.reduce((acc, raw) => acc.replace(raw, ''), content.replaceAll('｜｜DSML｜｜', DSML)).trim()
+        if (recovered.length > 0) {
+          const cleanContent = recovered.reduce(
+            (acc, raw) => acc.replace(raw, ''),
+            content.replaceAll('｜｜DSML｜｜', DSML),
+          ).trim()
           return createParseResult({
             content: cleanContent,
             toolCalls: recovered,
@@ -81,30 +96,17 @@ to invoke tool calls.`
             invalidToolNames,
           })
         }
-        return createParseResult({
-          content,
-          toolCalls: [],
-          protocol: 'deepseek_dsml',
-          rawMatches,
-          invalidToolNames,
-          malformedReason: 'Malformed DeepSeek DSML tool call block',
-        })
+        return malformedDsmlResult(content, rawMatches, invalidToolNames)
+      } else {
+        return createParseResult({ content, toolCalls: [], protocol: 'unknown', rawMatches, invalidToolNames })
       }
-      return createParseResult({ content, toolCalls: [], protocol: 'unknown', rawMatches, invalidToolNames })
     }
 
     for (const block of blocks) {
       rawMatches.push(block[0])
-      const parsed = parseInvokes(block[1], context, rawMatches, invalidToolNames, allowedNames)
+      const parsed = parseInvokes(block[1], context, rawMatches, invalidToolNames, allowedNames, dialect)
       if (parsed === 'malformed') {
-        return createParseResult({
-          content,
-          toolCalls: [],
-          protocol: 'deepseek_dsml',
-          rawMatches,
-          invalidToolNames,
-          malformedReason: 'Malformed DeepSeek DSML tool call block',
-        })
+        return malformedDsmlResult(content, rawMatches, invalidToolNames)
       }
       toolCalls.push(...parsed)
     }
@@ -146,14 +148,34 @@ to invoke tool calls.`
   },
 }
 
+type DsmlDialect = 'canonical' | 'dsh_wrapper'
+
+function malformedDsmlResult(
+  content: string,
+  rawMatches: string[],
+  invalidToolNames: string[],
+) {
+  return createParseResult({
+    content,
+    toolCalls: [],
+    protocol: 'deepseek_dsml',
+    rawMatches,
+    invalidToolNames,
+    malformedReason: 'Malformed DeepSeek DSML tool call block',
+  })
+}
+
 function parseInvokes(
   content: string,
   context: ToolParseContext,
   rawMatches: string[],
   invalidToolNames: string[],
   allowedNames: Set<string>,
+  dialect: DsmlDialect,
 ): ReturnType<typeof buildToolCall>[] | 'malformed' {
-  const invokePattern = new RegExp(`<${DSML}invoke\\s+name="([^"]+)"\\s*>([\\s\\S]*?)</${DSML}invoke>`, 'g')
+  const invokePattern = dialect === 'canonical'
+    ? new RegExp(`<${DSML}invoke\\s+name="([^"]+)"\\s*>([\\s\\S]*?)</${DSML}invoke>`, 'g')
+    : /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g
   const invokes = [...content.matchAll(invokePattern)]
   if (invokes.length === 0) return 'malformed'
 
@@ -165,7 +187,7 @@ function parseInvokes(
       invalidToolNames.push(name)
       continue
     }
-    const args = parseParameters(name, invoke[2], context.tools)
+    const args = parseParameters(name, invoke[2], context.tools, dialect)
     if (args === null) return 'malformed'
     toolCalls.push(
       buildToolCall(
@@ -181,11 +203,15 @@ function parseInvokes(
   return remainder ? 'malformed' : toolCalls
 }
 
-function parseParameters(name: string, content: string, tools: NormalizedToolDefinition[]): Record<string, unknown> | null {
-  const parameterPattern = new RegExp(
-    `<${DSML}parameter\\s+([^>]*)>([\\s\\S]*?)</${DSML}parameter>`,
-    'g',
-  )
+function parseParameters(
+  name: string,
+  content: string,
+  tools: NormalizedToolDefinition[],
+  dialect: DsmlDialect,
+): Record<string, unknown> | null {
+  const parameterPattern = dialect === 'canonical'
+    ? new RegExp(`<${DSML}parameter\\s+([^>]*)>([\\s\\S]*?)</${DSML}parameter>`, 'g')
+    : /<parameter\s+([^>]*)>([\s\S]*?)<\/parameter>/g
   const args: Record<string, unknown> = {}
   for (const match of content.matchAll(parameterPattern)) {
     const attrs = parseAttrs(match[1])
@@ -254,7 +280,11 @@ function safeParseObject(value: string): Record<string, unknown> {
 }
 
 function looksLikeDsml(content: string): boolean {
-  return content.includes(`<${DSML}`) || content.includes(`</${DSML}`) || content.includes('<｜｜DSML｜｜')
+  return content.includes(`<${DSML}`)
+    || content.includes(`</${DSML}`)
+    || content.includes(DSH_TOOL_START)
+    || content.includes(DSH_TOOL_END)
+    || content.includes('<｜｜DSML｜｜')
 }
 
 function escapeText(value: string): string {

@@ -103,6 +103,39 @@ def test_parse_completion_text_parallel_dsml_tool_calls() -> None:
     }
 
 
+def test_parse_completion_text_accepts_dsh_wrapper_dialect() -> None:
+    parsed = parse_completion_text(
+        "I will read the plan first.\n"
+        "<DSML｜tool_calls>\n"
+        '<invoke name="lookup">\n'
+        '<parameter name="query" string="true">task_plan.md</parameter>\n'
+        "</invoke>\n"
+        '<invoke name="lookup">\n'
+        '<parameter name="query" string="true">findings.md</parameter>\n'
+        "</invoke>\n"
+        "</DSML｜tool_calls>",
+        tools=TOOLS,
+    )
+
+    assert parsed.recovered is True
+    assert parsed.content == "I will read the plan first."
+    assert [call.arguments for call in parsed.tool_calls] == [
+        {"query": "task_plan.md"},
+        {"query": "findings.md"},
+    ]
+
+
+def test_parse_completion_text_rejects_malformed_dsh_wrapper_dialect() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<DSML｜tool_calls>"
+            '<invoke name="lookup">'
+            '<parameter name="query" string="true">missing close</invoke>'
+            "</DSML｜tool_calls>",
+            tools=TOOLS,
+        )
+
+
 def test_parse_completion_text_schema_aware_arguments_wrapper_recovery() -> None:
     parsed = parse_completion_text(
         "<｜DSML｜tool_calls>"

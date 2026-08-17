@@ -69,6 +69,33 @@ test('deepseek dsml parses native typed tool call and strips native syntax', () 
   assert.equal(result.content.includes('｜DSML｜'), false)
 })
 
+test('deepseek dsml parses DSH wrapper-dialect tool calls', () => {
+  const result = deepseekDsmlProtocol.parse(
+    'Read context first<DSML｜tool_calls><invoke name="default_api:read_file"><parameter name="filePath" string="true">/tmp/task_plan.md</parameter></invoke><invoke name="default_api:read_file"><parameter name="filePath" string="true">/tmp/findings.md</parameter></invoke></DSML｜tool_calls>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 2)
+  assert.deepEqual(
+    result.toolCalls.map((call) => JSON.parse(call.function.arguments)),
+    [{ filePath: '/tmp/task_plan.md' }, { filePath: '/tmp/findings.md' }],
+  )
+  assert.equal(result.content, 'Read context first')
+  assert.equal(result.content.includes('DSML｜'), false)
+})
+
+test('deepseek dsml rejects malformed DSH wrapper-dialect output explicitly', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<DSML｜tool_calls><invoke name="default_api:read_file"><parameter name="filePath" string="true">/tmp/a</invoke></DSML｜tool_calls>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 0)
+  assert.match(result.malformedReason || '', /Malformed DeepSeek DSML/)
+})
+
 test('deepseek dsml reports malformed native-looking output explicitly', () => {
   const result = deepseekDsmlProtocol.parse(
     '<｜DSML｜tool_calls><｜DSML｜invoke name="default_api:read_file"><｜DSML｜parameter name="filePath" string="true">/tmp/a</｜DSML｜invoke>',
