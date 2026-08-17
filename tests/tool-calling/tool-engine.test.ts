@@ -52,11 +52,11 @@ test('OpenAI tools plus DeepSeek choose managed prompt', () => {
   })
 
   assert.equal(result.plan.mode, 'managed')
-  assert.equal(result.plan.protocol, 'managed_xml')
+  assert.equal(result.plan.protocol, 'deepseek_dsml')
   assert.equal(result.plan.shouldInjectPrompt, true)
   assert.equal(result.tools, undefined)
   assert.equal(result.plan.tools.length, 2)
-  assert.match(result.messages[0].content as string, /<\|CHAT2API\|tool_calls>/)
+  assert.match(result.messages[0].content as string, /<｜DSML｜tool_calls>/)
 })
 
 test('explicit Cherry Studio MCP adapter uses managed prompt and preserves tool names', () => {
@@ -172,4 +172,24 @@ test('non-stream parsing only accepts the selected provider protocol', () => {
 
   assert.equal(result.choices[0].message.tool_calls, undefined)
   assert.equal(result.choices[0].message.content, '[function_calls][call:default_api:read_file]{"filePath":"/tmp/a"}[/call][/function_calls]')
+})
+
+test('DeepSeek malformed native DSML is surfaced instead of leaked as content', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request(),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '<｜DSML｜tool_calls><｜DSML｜invoke name="default_api:read_file"><｜DSML｜parameter name="filePath" string="true">/tmp/a</｜DSML｜invoke>',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  assert.throws(() => engine.applyNonStreamResponse(result, transformed.plan), /Malformed DeepSeek DSML/)
 })

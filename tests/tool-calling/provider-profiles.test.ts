@@ -6,8 +6,13 @@ const calls = [
   { id: 'call_1', name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
 ]
 
-test('first-version providers use managed prompt and managed xml by default', () => {
-  for (const providerId of ['deepseek', 'kimi', 'glm', 'qwen']) {
+test('deepseek uses native DSML while other first-version providers keep managed XML', () => {
+  const deepseek = getProviderToolProfile('deepseek')
+  assert.equal(deepseek.managedSupport, true)
+  assert.equal(deepseek.supportsNativeTools, false)
+  assert.equal(deepseek.preferredManagedProtocol, 'deepseek_dsml')
+
+  for (const providerId of ['kimi', 'glm', 'qwen']) {
     const profile = getProviderToolProfile(providerId)
 
     assert.equal(profile.managedSupport, true)
@@ -16,8 +21,18 @@ test('first-version providers use managed prompt and managed xml by default', ()
   }
 })
 
-test('priority providers format tool history with the Chat2API XML protocol', () => {
-  for (const providerId of ['deepseek', 'kimi', 'glm', 'qwen']) {
+test('priority providers format tool history with provider-specific protocols', () => {
+  const deepseek = getProviderToolProfile('deepseek')
+  assert.equal(
+    deepseek.formatAssistantToolCalls(calls),
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="default_api:read_file"><｜DSML｜parameter name="filePath" string="true">/tmp/a</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
+  )
+  assert.equal(
+    deepseek.formatToolResult({ toolCallId: 'call_1', content: 'file body' }),
+    '<tool_result>file body</tool_result>',
+  )
+
+  for (const providerId of ['kimi', 'glm', 'qwen']) {
     const profile = getProviderToolProfile(providerId)
 
     assert.equal(

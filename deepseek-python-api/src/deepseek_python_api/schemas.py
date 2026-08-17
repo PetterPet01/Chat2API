@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class TextContentPart(BaseModel):
@@ -56,6 +55,7 @@ class ChatMessage(BaseModel):
     content: str | list[ContentPart] | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] | None = None
+    reasoning_content: str | None = None
 
     @model_validator(mode="after")
     def validate_message_shape(self) -> ChatMessage:
@@ -74,19 +74,22 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     web_search: bool = False
-    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    reasoning_effort: Literal["low", "medium", "high", "max"] | None = None
     n: int = Field(default=1, ge=1)
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def normalize_reasoning_effort(cls, value: Any) -> Any:
+        return "high" if value == "medium" else value
 
     @model_validator(mode="after")
     def validate_supported_options(self) -> ChatCompletionRequest:
         if self.n != 1:
             raise ValueError("only n=1 is supported")
-        if self.tools:
-            raise ValueError("native tools are not supported by this standalone service")
-        if self.tool_choice not in (None, "none"):
-            raise ValueError("tool_choice is not supported")
+        if self.tool_choice not in (None, "auto"):
+            raise ValueError("only tool_choice='auto' is supported")
         return self
 
 
@@ -114,23 +117,6 @@ class ModelList(BaseModel):
 
 
 def tool_calls_to_prompt(tool_calls: list[ToolCall]) -> str:
-    blocks = []
-    for call in tool_calls:
-        try:
-            arguments: Any = json.loads(call.function.arguments)
-        except json.JSONDecodeError:
-            arguments = call.function.arguments
-        blocks.append(
-            "<tool_call>"
-            + json.dumps(
-                {
-                    "id": call.id,
-                    "name": call.function.name,
-                    "arguments": arguments,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "</tool_call>"
-        )
-    return "\n".join(blocks)
+    from .deepseek_v4 import format_tool_calls_as_dsml
+
+    return format_tool_calls_as_dsml(tool_calls)

@@ -1,4 +1,5 @@
 import type { NormalizedToolResult, ToolProtocolId } from './types.ts'
+import { deepseekDsmlProtocol } from './protocols/deepseekDsml.ts'
 import { managedXmlProtocol } from './protocols/managedXml.ts'
 
 export interface ProviderToolProfile {
@@ -22,10 +23,22 @@ const chat2ApiXmlHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
   },
 }
 
+const deepseekDsmlHistoryProfile: Omit<ProviderToolProfile, 'providerId'> = {
+  managedSupport: true,
+  supportsNativeTools: false,
+  preferredManagedProtocol: 'deepseek_dsml',
+  formatAssistantToolCalls(calls) {
+    return deepseekDsmlProtocol.formatAssistantToolCalls(calls)
+  },
+  formatToolResult(result) {
+    return deepseekDsmlProtocol.formatToolResult(result)
+  },
+}
+
 const profiles: Record<string, ProviderToolProfile> = {
   deepseek: {
     providerId: 'deepseek',
-    ...chat2ApiXmlHistoryProfile,
+    ...deepseekDsmlHistoryProfile,
   },
   kimi: {
     providerId: 'kimi',

@@ -5,6 +5,7 @@ export type ToolProtocolId =
   | 'openai_chat'
   | 'managed_bracket'
   | 'managed_xml'
+  | 'deepseek_dsml'
   | 'anthropic_tool_use'
   | 'codex_responses'
 

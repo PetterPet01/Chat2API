@@ -40,7 +40,7 @@ export interface ToolProviderSupportMeta {
   providerId: 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo'
   label: string
   managed: true
-  protocolId: 'managed_xml'
+  protocolId: 'managed_xml' | 'deepseek_dsml'
   status: 'supported'
 }
 
@@ -71,7 +71,7 @@ export const P0_TOOL_CLIENT_ADAPTERS: ToolClientAdapterMeta[] = [
 ]
 
 export const P0_TOOL_PROVIDER_SUPPORT: ToolProviderSupportMeta[] = [
-  { providerId: 'deepseek', label: 'DEEPSEEK', managed: true, protocolId: 'managed_xml', status: 'supported' },
+  { providerId: 'deepseek', label: 'DEEPSEEK', managed: true, protocolId: 'deepseek_dsml', status: 'supported' },
   { providerId: 'kimi', label: 'KIMI', managed: true, protocolId: 'managed_xml', status: 'supported' },
   { providerId: 'glm', label: 'GLM', managed: true, protocolId: 'managed_xml', status: 'supported' },
   { providerId: 'qwen', label: 'QWEN', managed: true, protocolId: 'managed_xml', status: 'supported' },

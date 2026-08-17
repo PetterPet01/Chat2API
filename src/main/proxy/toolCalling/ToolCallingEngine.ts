@@ -70,6 +70,10 @@ export class ToolCallingEngine {
     plan.diagnostics.invalidToolNames = parseResult.invalidToolNames
     plan.diagnostics.malformedReason = parseResult.malformedReason
 
+    if (parseResult.malformedReason) {
+      throw new Error(parseResult.malformedReason)
+    }
+
     if (parseResult.toolCalls.length === 0) return
 
     message.content = parseResult.content || null

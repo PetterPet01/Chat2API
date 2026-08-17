@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { managedBracketProtocol } from '../../src/main/proxy/toolCalling/protocols/managedBracket.ts'
 import { managedXmlProtocol } from '../../src/main/proxy/toolCalling/protocols/managedXml.ts'
+import { deepseekDsmlProtocol } from '../../src/main/proxy/toolCalling/protocols/deepseekDsml.ts'
 import { anthropicToolUseProtocol } from '../../src/main/proxy/toolCalling/protocols/anthropicToolUse.ts'
 import { codexResponsesProtocol } from '../../src/main/proxy/toolCalling/protocols/codexResponses.ts'
 
@@ -9,7 +10,13 @@ const tools = [
   {
     name: 'default_api:read_file',
     description: 'Read a file',
-    parameters: { type: 'object' },
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+        lineCount: { type: 'integer' },
+      },
+    },
     source: 'openai' as const,
   },
 ]
@@ -43,6 +50,34 @@ test('managed xml parses canonical XML compatibility form', () => {
 
   assert.equal(result.toolCalls.length, 1)
   assert.equal(JSON.parse(result.toolCalls[0].function.arguments).filePath, '/tmp/a')
+})
+
+test('deepseek dsml parses native typed tool call and strips native syntax', () => {
+  const result = deepseekDsmlProtocol.parse(
+    'Need data<｜DSML｜tool_calls><｜DSML｜invoke name="default_api:read_file"><｜DSML｜parameter name="filePath" string="true">/tmp/a</｜DSML｜parameter><｜DSML｜parameter name="lineCount" string="false">3</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 1)
+  assert.equal(result.toolCalls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), {
+    filePath: '/tmp/a',
+    lineCount: 3,
+  })
+  assert.equal(result.content, 'Need data')
+  assert.equal(result.content.includes('｜DSML｜'), false)
+})
+
+test('deepseek dsml reports malformed native-looking output explicitly', () => {
+  const result = deepseekDsmlProtocol.parse(
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="default_api:read_file"><｜DSML｜parameter name="filePath" string="true">/tmp/a</｜DSML｜invoke>',
+    { tools, protocol: 'deepseek_dsml' },
+  )
+
+  assert.equal(result.protocol, 'deepseek_dsml')
+  assert.equal(result.toolCalls.length, 0)
+  assert.match(result.malformedReason || '', /Malformed DeepSeek DSML/)
 })
 
 test('managed xml ignores fenced tool examples', () => {

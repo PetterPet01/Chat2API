@@ -250,25 +250,20 @@ def test_prompt_tool_calls_tool_results_and_merging() -> None:
     prompt = messages_to_prompt(request.messages)
 
     assert "first\n\nsecond" in prompt
-    assert '"arguments":"not-json"' in prompt
-    assert '<tool_result tool_call_id="call-1">tool result</tool_result>' in prompt
+    assert '<｜DSML｜invoke name="lookup">' in prompt
+    assert '<｜DSML｜parameter name="arguments" string="true">not-json</｜DSML｜parameter>' in prompt
+    assert '<tool_result>tool result</tool_result>' in prompt
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"tools": [{"type": "function", "function": {"name": "x"}}]},
-        {"tool_choice": "auto"},
+        {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "n": 2},
     ],
 )
-def test_request_rejects_tool_options(payload: dict[str, object]) -> None:
-    body: dict[str, object] = {
-        "model": "deepseek-v4-flash",
-        "messages": [{"role": "user", "content": "hi"}],
-        **payload,
-    }
+def test_request_rejects_unsupported_options(payload: dict) -> None:
     with pytest.raises(ValidationError):
-        ChatCompletionRequest.model_validate(body)
+        ChatCompletionRequest.model_validate(payload)
 
 
 @pytest.mark.asyncio

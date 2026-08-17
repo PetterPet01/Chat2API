@@ -27,6 +27,7 @@ from .proxies import normalize_proxy_url
 from .schemas import ChatCompletionRequest, ModelList, ModelObject
 from .service import CompletionContext, CompletionService
 from .settings import Settings, get_settings
+from .submission_page import SUBMISSION_PAGE_HTML
 from .token_manager import RotationStrategy, TokenLease, TokenManager
 from .upstream import DeepSeekClient
 
@@ -50,6 +51,16 @@ class AddManagedTokenRequest(BaseModel):
     name: str | None = None
     enabled: bool = True
     check: bool = False
+    proxy: str | None = None
+
+
+class SubmitAccountRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    password: str
+    token: str
+    name: str | None = None
     proxy: str | None = None
 
 
@@ -198,6 +209,25 @@ def create_app(
                 error_type="authentication_error",
             )
 
+    def require_submission_key(
+        authorization: str | None = Header(default=None),
+        x_submission_key: str | None = Header(default=None),
+    ) -> None:
+        runtime = _runtime(app)
+        expected = runtime.settings.configured_account_submission_key()
+        if not expected:
+            raise ConfigurationError("ACCOUNT_SUBMISSION_KEY must be configured")
+        provided = x_submission_key
+        if authorization and authorization.startswith("Bearer "):
+            provided = authorization[7:].strip()
+        if not provided or not secrets.compare_digest(provided, expected):
+            raise DeepSeekProxyError(
+                "Invalid submission key",
+                status_code=401,
+                code="invalid_submission_key",
+                error_type="authentication_error",
+            )
+
     async def resolve_token_lease(
         x_deepseek_token: str | None = Header(default=None),
     ) -> TokenLease:
@@ -296,7 +326,7 @@ def create_app(
         token_lease: TokenLease = Depends(resolve_token_lease),
     ) -> JSONResponse | StreamingResponse:
         context = await start_with_token_failover(body, token_lease)
-        if body.stream:
+        if body.stream and not body.tools:
             return StreamingResponse(
                 _runtime(app).service.stream_openai(context),
                 media_type="text/event-stream",
@@ -305,7 +335,59 @@ def create_app(
                     "X-Accel-Buffering": "no",
                 },
             )
+
         result = await _runtime(app).service.collect_openai(context)
+
+        if body.stream and body.tools:
+            from deepseek_python_api.sse import openai_chunk
+
+            async def mock_stream():
+                yield openai_chunk(
+                    completion_id=result["id"],
+                    model=result["model"],
+                    created=result["created"],
+                    delta={"role": "assistant"},
+                )
+                if result["choices"][0]["message"].get("reasoning_content"):
+                    yield openai_chunk(
+                        completion_id=result["id"],
+                        model=result["model"],
+                        created=result["created"],
+                        delta={"reasoning_content": result["choices"][0]["message"]["reasoning_content"]},
+                    )
+                if result["choices"][0]["message"].get("content"):
+                    yield openai_chunk(
+                        completion_id=result["id"],
+                        model=result["model"],
+                        created=result["created"],
+                        delta={"content": result["choices"][0]["message"]["content"]},
+                    )
+                if result["choices"][0]["message"].get("tool_calls"):
+                    for i, tc in enumerate(result["choices"][0]["message"]["tool_calls"]):
+                        yield openai_chunk(
+                            completion_id=result["id"],
+                            model=result["model"],
+                            created=result["created"],
+                            delta={"tool_calls": [{"index": i, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]}
+                        )
+                yield openai_chunk(
+                    completion_id=result["id"],
+                    model=result["model"],
+                    created=result["created"],
+                    delta={},
+                    finish_reason=result["choices"][0]["finish_reason"],
+                )
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                mock_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         return JSONResponse(result)
 
     @app.get("/v0/management/status", dependencies=[Depends(require_management_api_key)])
@@ -329,6 +411,19 @@ def create_app(
         if payload.check:
             view = await _runtime(app).token_manager.check_token(str(view["id"]))
         return view
+
+    @app.post("/v0/accounts/submit", dependencies=[Depends(require_submission_key)])
+    async def submit_account(
+        payload: Annotated[SubmitAccountRequest, Body()],
+    ) -> dict[str, object]:
+        view = await _runtime(app).token_manager.submit_account(
+            email=payload.email.strip(),
+            password=payload.password,
+            token=payload.token.strip(),
+            name=payload.name.strip() if payload.name else None,
+            proxy_url=normalize_request_proxy(payload.proxy),
+        )
+        return {"account": view}
 
     @app.get("/v0/management/tokens/{token_id}", dependencies=[Depends(require_management_api_key)])
     async def get_managed_token(token_id: str) -> dict[str, object]:
@@ -417,6 +512,10 @@ def create_app(
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:
         return HTMLResponse(DASHBOARD_HTML)
+
+    @app.get("/submit-account", response_class=HTMLResponse)
+    async def submit_account_page() -> HTMLResponse:
+        return HTMLResponse(SUBMISSION_PAGE_HTML)
 
     return app
 

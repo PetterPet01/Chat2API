@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from .deepseek_v4.dsml import DSMLParseError, parsed_tool_calls_to_openai, parse_completion_text
+from .errors import UpstreamProtocolError
 from .models import resolve_chat_options
 from .prompt import extract_image_urls, messages_to_prompt
 from .schemas import ChatCompletionRequest
@@ -30,6 +32,7 @@ class CompletionContext:
     model: str
     state: DeepSeekEventState
     upstream: DeepSeekStream
+    tools: list[dict[str, Any]] | None = None
     lease: TokenLease | None = None
 
 
@@ -52,7 +55,7 @@ class CompletionService:
         try:
             upstream = await self._client.start_completion(
                 user_token=token_lease.token,
-                prompt=messages_to_prompt(request.messages),
+                prompt=messages_to_prompt(request.messages, request.tools),
                 model_type=options.model_type,
                 search_enabled=options.search_enabled,
                 thinking_enabled=options.thinking_enabled,
@@ -75,6 +78,7 @@ class CompletionService:
                 reasoning_effort=request.reasoning_effort,
             ),
             upstream=upstream,
+            tools=request.tools,
             lease=token_lease,
         )
 
@@ -163,9 +167,6 @@ class CompletionService:
             if context.lease:
                 await context.lease.release(success=False, error=exc)
             raise
-        else:
-            if context.lease:
-                await context.lease.release(success=True)
         finally:
             await context.upstream.close()
 
@@ -173,8 +174,31 @@ class CompletionService:
         answer = "".join(content).strip()
         if citations:
             answer = f"{answer}\n\n{citations}" if answer else citations
-        message: dict[str, Any] = {"role": "assistant", "content": answer}
+
         reasoning_content = "".join(reasoning).strip()
+        try:
+            parsed_completion = parse_completion_text(answer, tools=context.tools)
+        except DSMLParseError as exc:
+            if context.lease:
+                await context.lease.release(success=False, error=exc)
+            raise UpstreamProtocolError(str(exc), code="malformed_deepseek_dsml") from exc
+
+        message: dict[str, Any] = {"role": "assistant"}
+        finish_reason = "stop"
+        if parsed_completion.tool_calls:
+            message["tool_calls"] = parsed_tool_calls_to_openai(parsed_completion.tool_calls)
+            message["content"] = parsed_completion.content or None
+            finish_reason = "tool_calls"
+        else:
+            if not parsed_completion.content and not reasoning_content:
+                empty_error = UpstreamProtocolError(
+                    "model returned a completed response with no content",
+                    code="empty_completion",
+                )
+                if context.lease:
+                    await context.lease.release(success=False, error=empty_error)
+                raise empty_error
+            message["content"] = parsed_completion.content
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
 
@@ -183,8 +207,10 @@ class CompletionService:
             "model": context.model,
             "object": "chat.completion",
             "created": context.created,
-            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }
         if context.state.accumulated_token_usage is not None:
             result["usage"] = {"total_tokens": context.state.accumulated_token_usage}
+        if context.lease:
+            await context.lease.release(success=True)
         return result

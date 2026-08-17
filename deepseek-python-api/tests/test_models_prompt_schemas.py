@@ -16,7 +16,15 @@ def test_resolve_chat_options_from_model_aliases() -> None:
 
 
 def test_resolve_chat_options_from_request_flags() -> None:
-    options = resolve_chat_options("deepseek-v4-flash", True, "medium")
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "medium",
+        }
+    )
+    options = resolve_chat_options("deepseek-v4-flash", True, request.reasoning_effort)
+    assert request.reasoning_effort == "high"
     assert options.model_type == "default"
     assert options.search_enabled is True
     assert options.thinking_enabled is True
