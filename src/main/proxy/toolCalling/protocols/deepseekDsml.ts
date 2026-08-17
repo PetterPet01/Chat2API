@@ -15,10 +15,8 @@ const TOOL_START = `<${DSML}tool_calls>`
 const TOOL_END = `</${DSML}tool_calls>`
 const INVOKE_END = `</${DSML}invoke>`
 const PARAM_END = `</${DSML}parameter>`
-const DSH_TOOL_START = '<DSML｜tool_calls>'
-const DSH_TOOL_END = '</DSML｜tool_calls>'
-const DSH_DAGGER_TOOL_START = '<DSML‡tool_calls>'
-const DSH_DAGGER_TOOL_END = '</DSML‡tool_calls>'
+const TAG_NAME_PATTERN = /<\s*(\/?)\s*([^\s>/]+)([^>]*)>/g
+const DSML_LOOKALIKE_PATTERN = /<\s*\/?[^\s>]*DSML[^\s>]*/
 
 export const deepseekDsmlProtocol: ToolProtocolAdapter = {
   id: 'deepseek_dsml',
@@ -55,8 +53,7 @@ to invoke tool calls.`
     return detectMarkers(buffer, [
       TOOL_START,
       `<${DSML}invoke`,
-      DSH_TOOL_START,
-      DSH_DAGGER_TOOL_START,
+      '<DSML',
       '<｜｜DSML｜｜tool_calls>',
       '<｜｜DSML｜｜invoke',
     ])
@@ -67,54 +64,45 @@ to invoke tool calls.`
     const rawMatches: string[] = []
     const invalidToolNames: string[] = []
     const toolCalls = []
-    let blocks = [...content.matchAll(new RegExp(`<${DSML}tool_calls>([\\s\\S]*?)</${DSML}tool_calls>`, 'g'))]
-    let dialect: DsmlDialect = 'canonical'
+    const blocks = findElements(content, 'tool_calls', { allowPlain: false })
+
+    if (blocks === 'malformed') return malformedDsmlResult(content, rawMatches, invalidToolNames)
 
     if (blocks.length === 0) {
-      blocks = [...content.matchAll(/<DSML｜tool_calls>([\s\S]*?)<\/DSML｜tool_calls>/g)]
-      if (blocks.length > 0) {
-        dialect = 'dsh_wrapper'
-      } else {
-        blocks = [...content.matchAll(/<DSML‡tool_calls>([\s\S]*?)<\/DSML‡tool_calls>/g)]
-        if (blocks.length > 0) {
-          dialect = 'dsh_dagger'
-        }
-      }
-      if (blocks.length === 0) {
-        if (looksLikeDsml(content)) {
-          const recovered = parseInvokes(
-            content.replaceAll('｜｜DSML｜｜', DSML),
-            context,
-            rawMatches,
-            invalidToolNames,
-            allowedNames,
-            'canonical',
-          )
-          if (recovered === 'malformed') {
-            return malformedDsmlResult(content, rawMatches, invalidToolNames)
-          }
-          if (recovered.length > 0) {
-            const cleanContent = recovered.reduce(
-              (acc, raw) => acc.replace(raw, ''),
-              content.replaceAll('｜｜DSML｜｜', DSML),
-            ).trim()
-            return createParseResult({
-              content: cleanContent,
-              toolCalls: recovered,
-              protocol: 'deepseek_dsml',
-              rawMatches,
-              invalidToolNames,
-            })
-          }
+      if (looksLikeDsml(content)) {
+        if (hasTagNamed(content, 'tool_calls')) {
           return malformedDsmlResult(content, rawMatches, invalidToolNames)
         }
-        return createParseResult({ content, toolCalls: [], protocol: 'unknown', rawMatches, invalidToolNames })
+        const recovered = parseInvokes(
+          content,
+          context,
+          rawMatches,
+          invalidToolNames,
+          allowedNames,
+          { allowPlain: false },
+        )
+        if (recovered === 'malformed') {
+          return malformedDsmlResult(content, rawMatches, invalidToolNames)
+        }
+        if (recovered.length > 0) {
+          const cleanContent = removeSpans(content, recovered.map((call) => call.rawText ?? '')).trim()
+          return createParseResult({
+            content: cleanContent,
+            toolCalls: recovered,
+            protocol: 'deepseek_dsml',
+            rawMatches,
+            invalidToolNames,
+          })
+        }
+        return malformedDsmlResult(content, rawMatches, invalidToolNames)
       }
+      return createParseResult({ content, toolCalls: [], protocol: 'unknown', rawMatches, invalidToolNames })
     }
 
     for (const block of blocks) {
-      rawMatches.push(block[0])
-      const parsed = parseInvokes(block[1], context, rawMatches, invalidToolNames, allowedNames, dialect)
+      if (block.attrs.trim()) return malformedDsmlResult(content, rawMatches, invalidToolNames)
+      rawMatches.push(block.raw)
+      const parsed = parseInvokes(block.body, context, rawMatches, invalidToolNames, allowedNames, { allowPlain: true })
       if (parsed === 'malformed') {
         return malformedDsmlResult(content, rawMatches, invalidToolNames)
       }
@@ -132,7 +120,7 @@ to invoke tool calls.`
       })
     }
 
-    const cleanContent = blocks.reduce((acc, block) => acc.replace(block[0], ''), content).trim()
+    const cleanContent = removeSpans(content, blocks.map((block) => block.raw)).trim()
     return createParseResult({
       content: cleanContent,
       toolCalls,
@@ -158,8 +146,6 @@ to invoke tool calls.`
   },
 }
 
-type DsmlDialect = 'canonical' | 'dsh_wrapper' | 'dsh_dagger'
-
 function malformedDsmlResult(
   content: string,
   rawMatches: string[],
@@ -181,25 +167,22 @@ function parseInvokes(
   rawMatches: string[],
   invalidToolNames: string[],
   allowedNames: Set<string>,
-  dialect: DsmlDialect,
+  options: { allowPlain: boolean },
 ): ReturnType<typeof buildToolCall>[] | 'malformed' {
-  const invokePattern = dialect === 'canonical'
-    ? new RegExp(`<${DSML}invoke\\s+name="([^"]+)"\\s*>([\\s\\S]*?)</${DSML}invoke>`, 'g')
-    : dialect === 'dsh_wrapper'
-      ? /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g
-      : /<DSML‡invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/DSML‡invoke>/g
-  const invokes = [...content.matchAll(invokePattern)]
-  if (invokes.length === 0) return 'malformed'
+  const invokes = findElements(content, 'invoke', options)
+  if (invokes === 'malformed' || invokes.length === 0) return 'malformed'
 
   const toolCalls: ReturnType<typeof buildToolCall>[] = []
   for (const invoke of invokes) {
-    const name = decodeXml(invoke[1].trim())
-    rawMatches.push(invoke[0])
+    const attrs = parseAttrs(invoke.attrs)
+    const name = attrs.name
+    if (!name) return 'malformed'
+    rawMatches.push(invoke.raw)
     if (!allowedNames.has(name)) {
       invalidToolNames.push(name)
       continue
     }
-    const args = parseParameters(name, invoke[2], context.tools, dialect)
+    const args = parseParameters(name, invoke.body, context.tools)
     if (args === null) return 'malformed'
     toolCalls.push(
       buildToolCall(
@@ -207,11 +190,11 @@ function parseInvokes(
         toolCalls.length,
         name,
         JSON.stringify(args),
-        invoke[0],
+        invoke.raw,
       ),
     )
   }
-  const remainder = content.replace(invokePattern, '').trim()
+  const remainder = removeSpans(content, invokes.map((invoke) => invoke.raw)).trim()
   return remainder ? 'malformed' : toolCalls
 }
 
@@ -219,22 +202,19 @@ function parseParameters(
   name: string,
   content: string,
   tools: NormalizedToolDefinition[],
-  dialect: DsmlDialect,
 ): Record<string, unknown> | null {
-  const parameterPattern = dialect === 'canonical'
-    ? new RegExp(`<${DSML}parameter\\s+([^>]*)>([\\s\\S]*?)</${DSML}parameter>`, 'g')
-    : dialect === 'dsh_wrapper'
-      ? /<parameter\s+([^>]*)>([\s\S]*?)<\/parameter>/g
-      : /<DSML‡parameter\s+([^>]*)>([\s\S]*?)<\/DSML‡parameter>/g
+  const params = findElements(content, 'parameter', { allowPlain: true })
+  if (params === 'malformed') return null
+
   const args: Record<string, unknown> = {}
-  for (const match of content.matchAll(parameterPattern)) {
-    const attrs = parseAttrs(match[1])
+  for (const param of params) {
+    const attrs = parseAttrs(param.attrs)
     const parameterName = attrs.name
     const stringFlag = attrs.string
     if (!parameterName || (stringFlag !== 'true' && stringFlag !== 'false')) return null
-    args[parameterName] = decodeParameter(match[2], stringFlag === 'true')
+    args[parameterName] = decodeParameter(param.body, stringFlag === 'true')
   }
-  const remainder = content.replace(parameterPattern, '').trim()
+  const remainder = removeSpans(content, params.map((param) => param.raw)).trim()
   if (remainder) return null
   return repairWrapper(name, args, tools)
 }
@@ -293,14 +273,79 @@ function safeParseObject(value: string): Record<string, unknown> {
   }
 }
 
+interface DsmlElement {
+  tag: string
+  attrs: string
+  body: string
+  raw: string
+}
+
+function findElements(
+  content: string,
+  semantic: string,
+  options: { allowPlain: boolean },
+): DsmlElement[] | 'malformed' {
+  const elements: DsmlElement[] = []
+  const stack: Array<{ tag: string, attrs: string, start: number, bodyStart: number }> = []
+  TAG_NAME_PATTERN.lastIndex = 0
+  for (const match of content.matchAll(TAG_NAME_PATTERN)) {
+    const closing = match[1]
+    const tag = match[2]
+    const attrs = match[3]
+    const semanticMatch = (options.allowPlain && tag === semantic) || isDsmlTag(tag, semantic)
+    if (!semanticMatch) continue
+
+    if (closing) {
+      const open = stack.pop()
+      if (!open || open.tag !== tag) return 'malformed'
+      if (stack.length === 0) {
+        elements.push({
+          tag,
+          attrs: open.attrs,
+          body: content.slice(open.bodyStart, match.index),
+          raw: content.slice(open.start, match.index + match[0].length),
+        })
+      }
+      continue
+    }
+
+    if (attrs.trimEnd().endsWith('/')) return 'malformed'
+    stack.push({ tag, attrs, start: match.index, bodyStart: match.index + match[0].length })
+  }
+  return stack.length > 0 ? 'malformed' : elements
+}
+
+function isDsmlTag(tag: string, semantic: string): boolean {
+  if (!tag.endsWith(semantic)) return false
+  const marker = tag.slice(0, -semantic.length)
+  if (!marker.includes('DSML')) return false
+  return marker
+    .split('DSML')
+    .every((part) => [...part].every(isMarkerChar))
+}
+
+function isMarkerChar(char: string): boolean {
+  return /^[\p{P}\p{S}]$/u.test(char)
+}
+
+function hasTagNamed(content: string, semantic: string): boolean {
+  TAG_NAME_PATTERN.lastIndex = 0
+  for (const match of content.matchAll(TAG_NAME_PATTERN)) {
+    const tag = match[2]
+    if (tag === semantic || isDsmlTag(tag, semantic)) return true
+  }
+  return false
+}
+
+function removeSpans(content: string, rawSpans: string[]): string {
+  return rawSpans.reduce((acc, raw) => acc.replace(raw, ''), content)
+}
+
 function looksLikeDsml(content: string): boolean {
   return content.includes(`<${DSML}`)
     || content.includes(`</${DSML}`)
-    || content.includes(DSH_TOOL_START)
-    || content.includes(DSH_TOOL_END)
-    || content.includes(DSH_DAGGER_TOOL_START)
-    || content.includes(DSH_DAGGER_TOOL_END)
     || content.includes('<｜｜DSML｜｜')
+    || DSML_LOOKALIKE_PATTERN.test(content)
 }
 
 function escapeText(value: string): string {

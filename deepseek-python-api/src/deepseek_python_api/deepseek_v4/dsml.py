@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -40,55 +41,46 @@ You MUST strictly follow the above defined tool name and parameter schemas
 to invoke tool calls.
 """
 
-_TOOL_BLOCK_PATTERN = re.compile(
-    rf"<{re.escape(DSML)}tool_calls>\s*(?P<body>.*?)\s*</{re.escape(DSML)}tool_calls>",
-    re.DOTALL,
-)
-_INVOKE_PATTERN = re.compile(
-    rf"<{re.escape(DSML)}invoke\s+name=(?P<quote>['\"])(?P<name>.*?)(?P=quote)>\s*"
-    rf"(?P<body>.*?)\s*</{re.escape(DSML)}invoke>",
-    re.DOTALL,
-)
-_PARAM_PATTERN = re.compile(
-    rf"<{re.escape(DSML)}parameter\s+"
-    rf"(?P<attrs>[^>]*)>"
-    rf"(?P<value>.*?)"
-    rf"</{re.escape(DSML)}parameter>",
-    re.DOTALL,
-)
-
-# DeepSeek Harness has emitted these legacy-compatible wrapper dialects in the
-# wild. Keep them isolated from the canonical V4 grammar: only complete DSH
-# wrappers may use their non-canonical child tag spellings.
-_DSH_TOOL_BLOCK_PATTERN = re.compile(
-    r"<DSML｜tool_calls>\s*(?P<body>.*?)\s*</DSML｜tool_calls>",
-    re.DOTALL,
-)
-_DSH_INVOKE_PATTERN = re.compile(
-    r"<invoke\s+name=(?P<quote>['\"])(?P<name>.*?)(?P=quote)>\s*"
-    r"(?P<body>.*?)\s*</invoke>",
-    re.DOTALL,
-)
-_DSH_PARAM_PATTERN = re.compile(
-    r"<parameter\s+(?P<attrs>[^>]*)>(?P<value>.*?)</parameter>",
-    re.DOTALL,
-)
-_DSH_DAGGER_TOOL_BLOCK_PATTERN = re.compile(
-    r"<DSML‡tool_calls>\s*(?P<body>.*?)\s*</DSML‡tool_calls>",
-    re.DOTALL,
-)
-_DSH_DAGGER_INVOKE_PATTERN = re.compile(
-    r"<DSML‡invoke\s+name=(?P<quote>['\"])(?P<name>.*?)(?P=quote)>\s*"
-    r"(?P<body>.*?)\s*</DSML‡invoke>",
-    re.DOTALL,
-)
-_DSH_DAGGER_PARAM_PATTERN = re.compile(
-    r"<DSML‡parameter\s+(?P<attrs>[^>]*)>(?P<value>.*?)</DSML‡parameter>",
-    re.DOTALL,
-)
+_TAG_NAME_PATTERN = re.compile(r"<\s*(/?)\s*([^\s>/]+)([^>]*)>", re.DOTALL)
 _ATTR_PATTERN = re.compile(r"([a-zA-Z_][\w:-]*)\s*=\s*(['\"])(.*?)\2", re.DOTALL)
-_LEGACY_WRONG_DSML_PATTERN = re.compile(r"<\s*/?｜｜DSML｜｜(?:tool_calls|invoke|parameter)\b")
-_DSH_WRAPPER_PATTERN = re.compile(r"<\s*/?DSML[｜‡]tool_calls\b")
+_DSML_LOOKALIKE_PATTERN = re.compile(r"<\s*/?[^\s>]*DSML[^\s>]*")
+
+
+@dataclass(frozen=True, slots=True)
+class _Element:
+    tag: str
+    attrs: str
+    body: str
+    start: int
+    end: int
+
+
+# DeepSeek Harness has emitted several DSML marker spellings in the wild. Treat
+# marker glyphs as syntax around the semantic tag name instead of enumerating
+# individual dialects: marker code points may be Unicode punctuation or symbols,
+# while letters/numbers beyond the exact "DSML" token are rejected.
+def _is_marker_char(char: str) -> bool:
+    return unicodedata.category(char)[0] in {"P", "S"}
+
+
+def _split_dsml_tag(tag: str, semantic: str) -> str | None:
+    if not tag.endswith(semantic):
+        return None
+    marker = tag[: -len(semantic)]
+    if "DSML" not in marker:
+        return None
+    parts = marker.split("DSML")
+    if any(any(not _is_marker_char(char) for char in part) for part in parts):
+        return None
+    return marker
+
+
+def _is_dsml_tag(tag: str, semantic: str) -> bool:
+    return _split_dsml_tag(tag, semantic) is not None
+
+
+def _uses_compat_tag(tag: str) -> bool:
+    return tag != f"{DSML}tool_calls"
 
 
 class DSMLParseError(ValueError):
@@ -135,27 +127,15 @@ def parse_completion_text(
     tools: list[dict[str, Any]] | None = None,
 ) -> ParsedDSMLCompletion:
     requested = _requested_tool_schemas(tools)
-    blocks = list(_TOOL_BLOCK_PATTERN.finditer(text))
-    invoke_pattern = _INVOKE_PATTERN
-    parameter_pattern = _PARAM_PATTERN
-    recovered = False
-    if not blocks:
-        blocks = list(_DSH_TOOL_BLOCK_PATTERN.finditer(text))
-        if blocks:
-            invoke_pattern = _DSH_INVOKE_PATTERN
-            parameter_pattern = _DSH_PARAM_PATTERN
-            recovered = True
-        else:
-            blocks = list(_DSH_DAGGER_TOOL_BLOCK_PATTERN.finditer(text))
-            if blocks:
-                invoke_pattern = _DSH_DAGGER_INVOKE_PATTERN
-                parameter_pattern = _DSH_DAGGER_PARAM_PATTERN
-                recovered = True
+    blocks = _find_elements(text, "tool_calls", allow_plain=False)
+    recovered = any(_uses_compat_tag(block.tag) for block in blocks)
     if not blocks:
         if _looks_like_dsml(text):
+            if _has_tag_named(text, "tool_calls"):
+                raise DSMLParseError("Malformed DeepSeek DSML tool call block")
             recovered_invokes = _parse_recoverable_without_wrapper(text, requested)
             if recovered_invokes is not None:
-                content = _strip_invokes(text, recovered_invokes.names).strip()
+                content = _remove_spans(text, recovered_invokes.spans).strip()
                 return ParsedDSMLCompletion(
                     content=content,
                     tool_calls=recovered_invokes.calls,
@@ -166,21 +146,16 @@ def parse_completion_text(
 
     tool_calls: list[ParsedDSMLToolCall] = []
     for block in blocks:
-        parsed = _parse_tool_block(
-            block.group("body"),
-            requested,
-            invoke_pattern=invoke_pattern,
-            parameter_pattern=parameter_pattern,
-        )
+        if block.attrs.strip():
+            raise DSMLParseError("Unexpected attributes on DeepSeek DSML tool_calls block")
+        parsed = _parse_tool_block(block.body, requested)
         tool_calls.extend(parsed)
 
     if not tool_calls:
         raise DSMLParseError("DeepSeek DSML tool call block did not contain any invokes")
 
-    content = text
-    for block in reversed(blocks):
-        content = content[: block.start()] + content[block.end() :]
-    return ParsedDSMLCompletion(content=content.strip(), tool_calls=tool_calls, recovered=recovered)
+    content = _remove_spans(text, [(block.start, block.end) for block in blocks]).strip()
+    return ParsedDSMLCompletion(content=content, tool_calls=tool_calls, recovered=recovered)
 
 
 def parsed_tool_calls_to_openai(calls: list[ParsedDSMLToolCall]) -> list[dict[str, Any]]:
@@ -200,23 +175,16 @@ def parsed_tool_calls_to_openai(calls: list[ParsedDSMLToolCall]) -> list[dict[st
 def _parse_tool_block(
     body: str,
     requested: dict[str, dict[str, Any]],
-    *,
-    invoke_pattern: re.Pattern[str] = _INVOKE_PATTERN,
-    parameter_pattern: re.Pattern[str] = _PARAM_PATTERN,
 ) -> list[ParsedDSMLToolCall]:
     calls: list[ParsedDSMLToolCall] = []
     consumed: list[tuple[int, int]] = []
-    for match in invoke_pattern.finditer(body):
-        consumed.append(match.span())
-        name = html.unescape(match.group("name"))
-        calls.append(
-            _parse_invoke(
-                name,
-                match.group("body"),
-                requested,
-                parameter_pattern=parameter_pattern,
-            )
-        )
+    for invoke in _find_elements(body, "invoke", allow_plain=True):
+        consumed.append((invoke.start, invoke.end))
+        attrs = _parse_attrs(invoke.attrs)
+        name = attrs.get("name")
+        if not name:
+            raise DSMLParseError("DeepSeek DSML invoke is missing a name")
+        calls.append(_parse_invoke(name, invoke.body, requested))
     remainder = _remove_spans(body, consumed).strip()
     if remainder:
         raise DSMLParseError("Unexpected text inside DeepSeek DSML tool_calls block")
@@ -227,23 +195,21 @@ def _parse_invoke(
     name: str,
     body: str,
     requested: dict[str, dict[str, Any]],
-    *,
-    parameter_pattern: re.Pattern[str] = _PARAM_PATTERN,
 ) -> ParsedDSMLToolCall:
     if requested and name not in requested:
         raise DSMLParseError(f"Unknown DeepSeek DSML tool name: {name}")
     args: dict[str, Any] = {}
     consumed: list[tuple[int, int]] = []
-    for match in parameter_pattern.finditer(body):
-        consumed.append(match.span())
-        attrs = _parse_attrs(match.group("attrs"))
+    for param in _find_elements(body, "parameter", allow_plain=True):
+        consumed.append((param.start, param.end))
+        attrs = _parse_attrs(param.attrs)
         param_name = attrs.get("name")
         if not param_name:
             raise DSMLParseError("DeepSeek DSML parameter is missing a name")
         is_string = attrs.get("string")
         if is_string not in {"true", "false"}:
             raise DSMLParseError("DeepSeek DSML parameter is missing string=\"true|false\"")
-        args[param_name] = _decode_parameter(match.group("value"), is_string == "true")
+        args[param_name] = _decode_parameter(param.body, is_string == "true")
     remainder = _remove_spans(body, consumed).strip()
     if remainder:
         raise DSMLParseError("Unexpected text inside DeepSeek DSML invoke block")
@@ -377,40 +343,74 @@ def _looks_like_dsml(text: str) -> bool:
     return (
         f"<{DSML}" in text
         or f"</{DSML}" in text
-        or _LEGACY_WRONG_DSML_PATTERN.search(text) is not None
-        or _DSH_WRAPPER_PATTERN.search(text) is not None
+        or "<｜｜DSML｜｜" in text
+        or _DSML_LOOKALIKE_PATTERN.search(text) is not None
     )
 
 
 @dataclass(frozen=True, slots=True)
 class _RecoveredInvokes:
     calls: list[ParsedDSMLToolCall]
-    names: list[str]
+    spans: list[tuple[int, int]]
 
 
 def _parse_recoverable_without_wrapper(
     text: str,
     requested: dict[str, dict[str, Any]],
 ) -> _RecoveredInvokes | None:
-    normalized = text.replace("｜｜DSML｜｜", DSML)
-    if TOOL_START in normalized or TOOL_END in normalized:
-        return None
     calls: list[ParsedDSMLToolCall] = []
-    names: list[str] = []
-    for match in _INVOKE_PATTERN.finditer(normalized):
-        name = html.unescape(match.group("name"))
-        if requested and name not in requested:
+    spans: list[tuple[int, int]] = []
+    for invoke in _find_elements(text, "invoke", allow_plain=False):
+        attrs = _parse_attrs(invoke.attrs)
+        name = attrs.get("name")
+        if not name or (requested and name not in requested):
             return None
-        calls.append(_parse_invoke(name, match.group("body"), requested))
-        names.append(name)
+        calls.append(_parse_invoke(name, invoke.body, requested))
+        spans.append((invoke.start, invoke.end))
     if not calls:
         return None
-    return _RecoveredInvokes(calls=calls, names=names)
+    return _RecoveredInvokes(calls=calls, spans=spans)
 
 
-def _strip_invokes(text: str, _names: list[str]) -> str:
-    normalized = text.replace("｜｜DSML｜｜", DSML)
-    return _INVOKE_PATTERN.sub("", normalized)
+def _find_elements(text: str, semantic: str, *, allow_plain: bool) -> list[_Element]:
+    elements: list[_Element] = []
+    stack: list[tuple[str, str, str, int, int]] = []
+    for match in _TAG_NAME_PATTERN.finditer(text):
+        closing, tag, attrs = match.groups()
+        semantic_match = tag == semantic if allow_plain else False
+        if not semantic_match:
+            semantic_match = _is_dsml_tag(tag, semantic)
+        if not semantic_match:
+            continue
+        if closing:
+            if not stack or stack[-1][0] != tag:
+                raise DSMLParseError("Malformed DeepSeek DSML tool call block")
+            _open_tag, open_attrs, _open_raw, start, body_start = stack.pop()
+            if not stack:
+                elements.append(
+                    _Element(
+                        tag=tag,
+                        attrs=open_attrs,
+                        body=text[body_start : match.start()],
+                        start=start,
+                        end=match.end(),
+                    )
+                )
+            continue
+        if attrs.rstrip().endswith("/"):
+            raise DSMLParseError("Malformed DeepSeek DSML tool call block")
+        stack.append((tag, attrs, match.group(0), match.start(), match.end()))
+    if stack:
+        raise DSMLParseError("Malformed DeepSeek DSML tool call block")
+    return elements
+
+
+def _has_tag_named(text: str, semantic: str) -> bool:
+    for match in _TAG_NAME_PATTERN.finditer(text):
+        tag = match.group(2)
+        if tag == semantic or _is_dsml_tag(tag, semantic):
+            return True
+    return False
 
 
 def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:

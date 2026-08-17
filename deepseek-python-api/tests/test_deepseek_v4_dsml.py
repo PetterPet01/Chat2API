@@ -169,6 +169,79 @@ def test_parse_completion_text_rejects_malformed_dsh_dagger_dialect() -> None:
         )
 
 
+def test_parse_completion_text_accepts_structural_dsml_marker_variants() -> None:
+    parsed = parse_completion_text(
+        "<DSML:tool_calls>"
+        '<DSML:invoke name="lookup">'
+        '<DSML:parameter name="query" string="true">colon</DSML:parameter>'
+        '<DSML:parameter name="count" string="false">2</DSML:parameter>'
+        "</DSML:invoke>"
+        '<DSML:invoke name="lookup">'
+        '<parameter name="query" string="true">plain child</parameter>'
+        "</DSML:invoke>"
+        "</DSML:tool_calls>",
+        tools=TOOLS,
+    )
+
+    assert parsed.recovered is True
+    assert [call.arguments for call in parsed.tool_calls] == [
+        {"query": "colon", "count": 2},
+        {"query": "plain child"},
+    ]
+
+
+def test_parse_completion_text_accepts_unseen_unicode_symbol_marker() -> None:
+    parsed = parse_completion_text(
+        "<DSML§tool_calls>"
+        '<DSML§invoke name="lookup">'
+        '<DSML§parameter name="query" string="true">section</DSML§parameter>'
+        "</DSML§invoke>"
+        "</DSML§tool_calls>",
+        tools=TOOLS,
+    )
+
+    assert parsed.recovered is True
+    assert parsed.tool_calls[0].arguments == {"query": "section"}
+
+
+def test_parse_completion_text_rejects_mismatched_marker_variants() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<DSML:tool_calls>"
+            '<DSML:invoke name="lookup">'
+            '<DSML:parameter name="query" string="true">x</DSML:parameter>'
+            "</DSML‡invoke>"
+            "</DSML:tool_calls>",
+            tools=TOOLS,
+        )
+
+
+def test_parse_completion_text_rejects_arbitrary_unmarked_xml() -> None:
+    parsed = parse_completion_text(
+        "<tool_calls>"
+        '<invoke name="lookup">'
+        '<parameter name="query" string="true">x</parameter>'
+        "</invoke>"
+        "</tool_calls>",
+        tools=TOOLS,
+    )
+
+    assert parsed.tool_calls == []
+    assert parsed.content.startswith("<tool_calls>")
+
+
+def test_parse_completion_text_rejects_dsml_tag_with_extra_letters() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<xDSMLy_tool_calls>"
+            '<xDSMLy_invoke name="lookup">'
+            '<xDSMLy_parameter name="query" string="true">x</xDSMLy_parameter>'
+            "</xDSMLy_invoke>"
+            "</xDSMLy_tool_calls>",
+            tools=TOOLS,
+        )
+
+
 def test_parse_completion_text_schema_aware_arguments_wrapper_recovery() -> None:
     parsed = parse_completion_text(
         "<｜DSML｜tool_calls>"
