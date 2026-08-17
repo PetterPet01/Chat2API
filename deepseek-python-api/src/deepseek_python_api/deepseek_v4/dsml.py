@@ -57,9 +57,9 @@ _PARAM_PATTERN = re.compile(
     re.DOTALL,
 )
 
-# DeepSeek Harness has emitted this legacy-compatible wrapper dialect in the
-# wild. Keep it isolated from the canonical V4 grammar: only a complete
-# DSML｜tool_calls wrapper may contain unprefixed invoke/parameter tags.
+# DeepSeek Harness has emitted these legacy-compatible wrapper dialects in the
+# wild. Keep them isolated from the canonical V4 grammar: only complete DSH
+# wrappers may use their non-canonical child tag spellings.
 _DSH_TOOL_BLOCK_PATTERN = re.compile(
     r"<DSML｜tool_calls>\s*(?P<body>.*?)\s*</DSML｜tool_calls>",
     re.DOTALL,
@@ -73,9 +73,22 @@ _DSH_PARAM_PATTERN = re.compile(
     r"<parameter\s+(?P<attrs>[^>]*)>(?P<value>.*?)</parameter>",
     re.DOTALL,
 )
+_DSH_DAGGER_TOOL_BLOCK_PATTERN = re.compile(
+    r"<DSML‡tool_calls>\s*(?P<body>.*?)\s*</DSML‡tool_calls>",
+    re.DOTALL,
+)
+_DSH_DAGGER_INVOKE_PATTERN = re.compile(
+    r"<DSML‡invoke\s+name=(?P<quote>['\"])(?P<name>.*?)(?P=quote)>\s*"
+    r"(?P<body>.*?)\s*</DSML‡invoke>",
+    re.DOTALL,
+)
+_DSH_DAGGER_PARAM_PATTERN = re.compile(
+    r"<DSML‡parameter\s+(?P<attrs>[^>]*)>(?P<value>.*?)</DSML‡parameter>",
+    re.DOTALL,
+)
 _ATTR_PATTERN = re.compile(r"([a-zA-Z_][\w:-]*)\s*=\s*(['\"])(.*?)\2", re.DOTALL)
 _LEGACY_WRONG_DSML_PATTERN = re.compile(r"<\s*/?｜｜DSML｜｜(?:tool_calls|invoke|parameter)\b")
-_DSH_WRAPPER_PATTERN = re.compile(r"<\s*/?DSML｜tool_calls\b")
+_DSH_WRAPPER_PATTERN = re.compile(r"<\s*/?DSML[｜‡]tool_calls\b")
 
 
 class DSMLParseError(ValueError):
@@ -132,7 +145,14 @@ def parse_completion_text(
             invoke_pattern = _DSH_INVOKE_PATTERN
             parameter_pattern = _DSH_PARAM_PATTERN
             recovered = True
-        elif _looks_like_dsml(text):
+        else:
+            blocks = list(_DSH_DAGGER_TOOL_BLOCK_PATTERN.finditer(text))
+            if blocks:
+                invoke_pattern = _DSH_DAGGER_INVOKE_PATTERN
+                parameter_pattern = _DSH_DAGGER_PARAM_PATTERN
+                recovered = True
+    if not blocks:
+        if _looks_like_dsml(text):
             recovered_invokes = _parse_recoverable_without_wrapper(text, requested)
             if recovered_invokes is not None:
                 content = _strip_invokes(text, recovered_invokes.names).strip()
@@ -142,8 +162,7 @@ def parse_completion_text(
                     recovered=True,
                 )
             raise DSMLParseError("Malformed DeepSeek DSML tool call block")
-        else:
-            return ParsedDSMLCompletion(content=text.strip(), tool_calls=[])
+        return ParsedDSMLCompletion(content=text.strip(), tool_calls=[])
 
     tool_calls: list[ParsedDSMLToolCall] = []
     for block in blocks:

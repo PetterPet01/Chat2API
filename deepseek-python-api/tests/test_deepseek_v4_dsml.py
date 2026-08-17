@@ -136,6 +136,39 @@ def test_parse_completion_text_rejects_malformed_dsh_wrapper_dialect() -> None:
         )
 
 
+def test_parse_completion_text_accepts_dsh_dagger_dialect() -> None:
+    parsed = parse_completion_text(
+        "I'll start by restoring context.\n"
+        "<DSML‡tool_calls>\n"
+        '<DSML‡invoke name="lookup">\n'
+        '<DSML‡parameter name="query" string="true">task_plan.md</DSML‡parameter>\n'
+        "</DSML‡invoke>\n"
+        '<DSML‡invoke name="lookup">\n'
+        '<DSML‡parameter name="query" string="true">findings.md</DSML‡parameter>\n'
+        "</DSML‡invoke>\n"
+        "</DSML‡tool_calls>",
+        tools=TOOLS,
+    )
+
+    assert parsed.recovered is True
+    assert parsed.content == "I'll start by restoring context."
+    assert [call.arguments for call in parsed.tool_calls] == [
+        {"query": "task_plan.md"},
+        {"query": "findings.md"},
+    ]
+
+
+def test_parse_completion_text_rejects_malformed_dsh_dagger_dialect() -> None:
+    with pytest.raises(DSMLParseError):
+        parse_completion_text(
+            "<DSML‡tool_calls>"
+            '<DSML‡invoke name="lookup">'
+            '<DSML‡parameter name="query" string="true">missing close</DSML‡invoke>'
+            "</DSML‡tool_calls>",
+            tools=TOOLS,
+        )
+
+
 def test_parse_completion_text_schema_aware_arguments_wrapper_recovery() -> None:
     parsed = parse_completion_text(
         "<｜DSML｜tool_calls>"
